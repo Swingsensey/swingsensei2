@@ -1,4 +1,4 @@
-лimport * as tf from '@tensorflow/tfjs-node';
+import * as tf from '@tensorflow/tfjs-node';
 import Redis from 'ioredis';
 import axios from 'axios';
 import { NewsSignal, Token } from '../utils/types';
