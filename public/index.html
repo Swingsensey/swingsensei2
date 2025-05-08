@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SwingSensei Дашборд</title>
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.development.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/babel-standalone@7/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    const App = () => {
+      const [tokens, setTokens] = useState([]);
+      const [trades, setTrades] = useState([]);
+      const [stats, setStats] = useState({ roi: 0, winRate: 0 });
+      const [filters, setFilters] = useState({
+        trending5min: false,
+        nextBC5min: false,
+        solanaSwingSniper: false,
+      });
+      const [monitoring, setMonitoring] = useState(false);
+      const [alerts, setAlerts] = useState([]);
+      const ws = new WebSocket('ws://localhost:8080');
+
+      useEffect(() => {
+        ws.onopen = () => console.log('WebSocket подключён');
+        ws.onmessage = (event) => {
+          const data = JSON.parse(event.data);
+          if (data.type === 'tokens:new') setTokens(data.tokens);
+          if (data.type === 'trades:executed') setTrades(data.trades);
+          if (data.type === 'stats') setStats(data.stats);
+          if (data.type === 'errors:detected') setAlerts([...alerts, data.error]);
+        };
+        ws.onerror = (error) => setAlerts([...alerts, 'WebSocket ошибка']);
+        return () => ws.close();
+      }, [alerts]);
+
+      const toggleMonitoring = async () => {
+        try {
+          const response = await fetch(`/api/${monitoring ? 'stop' : 'start'}-monitoring`, {
+            method: 'POST',
+            headers: { 'Authorization': 'Bearer your_jwt_token' },
+          });
+          if (response.ok) setMonitoring(!monitoring);
+        } catch (error) {
+          setAlerts([...alerts, 'Ошибка управления мониторингом']);
+        }
+      };
+
+      const scrapeGMGN = async () => {
+        try {
+          const response = await fetch('/api/scrape-gmgn', {
+            method: 'POST',
+            headers: { 'Authorization': 'Bearer your_jwt_token' },
+          });
+          if (!response.ok) setAlerts([...alerts, 'Ошибка скрапинга GMGN.ai']);
+        } catch (error) {
+          setAlerts([...alerts, 'Ошибка скрапинга GMGN.ai']);
+        }
+      };
+
+      const handleFilterChange = (filter) => {
+        setFilters({ ...filters, [filter]: !filters[filter] });
+      };
+
+      return (
+        <div className="container mx-auto p-4">
+          <h1 className="text-3xl font-bold mb-4">SwingSensei Дашборд</h1>
+
+          {/* Фильтры */}
+          <div className="mb-4">
+            <h2 className="text-xl font-semibold">Фильтры</h2>
+            <label className="block">
+              <input
+                type="checkbox"
+                checked={filters.trending5min}
+                onChange={() => handleFilterChange('trending5min')}
+                className="mr-2"
+              />
+              Trending 5min
+            </label>
+            <label className="block">
+              <input
+                type="checkbox"
+                checked={filters.nextBC5min}
+                onChange={() => handleFilterChange('nextBC5min')}
+                className="mr-2"
+              />
+              NextBC 5min
+            </label>
+            <label className="block">
+              <input
+                type="checkbox"
+                checked={filters.solanaSwingSniper}
+                onChange={() => handleFilterChange('solanaSwingSniper')}
+                className="mr-2"
+              />
+              Solana Swing Sniper
+            </label>
+          </div>
+
+          {/* Управление */}
+          <div className="mb-4">
+            <button
+              onClick={toggleMonitoring}
+              className="bg-blue-500 text-white px-4 py-2 rounded mr-2"
+            >
+              {monitoring ? 'Остановить мониторинг' : 'Запустить мониторинг'}
+            </button>
+            <button
+              onClick={scrapeGMGN}
+              className="bg-green-500 text-white px-4 py-2 rounded"
+            >
+              Скрапинг GMGN.ai
+            </button>
+          </div>
+
+          {/* Таблица токенов */}
+          <div className="mb-4">
+            <h2 className="text-xl font-semibold">Токены</h2>
+            <table className="w-full border-collapse border">
+              <thead>
+                <tr className="bg-gray-200">
+                  <th className="border p-2">Тикер</th>
+                  <th className="border p-2">Цена</th>
+                  <th className="border p-2">Объём</th>
+                  <th className="border p-2">Капитализация</th>
+                  <th className="border p-2">Активность китов</th>
+                </tr>
+              </thead>
+              <tbody>
+                {tokens.map((token, index) => (
+                  <tr key={index}>
+                    <td className="border p-2">{token.ticker}</td>
+                    <td className="border p-2">{token.price}</td>
+                    <td className="border p-2">{token.volume}</td>
+                    <td className="border p-2">{token.marketCap}</td>
+                    <td className="border p-2">{token.whaleActivity}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* История сделок */}
+          <div className="mb-4">
+            <h2 className="text-xl font-semibold">История сделок</h2>
+            <table className="w-full border-collapse border">
+              <thead>
+                <tr className="bg-gray-200">
+                  <th className="border p-2">Тикер</th>
+                  <th className="border p-2">Действие</th>
+                  <th className="border p-2">Цена</th>
+                  <th className="border p-2">ROI</th>
+                </tr>
+              </thead>
+              <tbody>
+                {trades.map((trade, index) => (
+                  <tr key={index}>
+                    <td className="border p-2">{trade.ticker}</td>
+                    <td className="border p-2">{trade.action}</td>
+                    <td className="border p-2">{trade.price}</td>
+                    <td className="border p-2">{trade.ROI}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Статистика */}
+          <div className="mb-4">
+            <h2 className="text-xl font-semibold">Статистика</h2>
+            <p>ROI: {stats.roi}%</p>
+            <p>Win Rate: {stats.winRate}%</p>
+          </div>
+
+          {/* Алерты */}
+          <div>
+            <h2 className="text-xl font-semibold">Алерты</h2>
+            {alerts.map((alert, index) => (
+              <p key={index} className="text-red-500">{alert}</p>
+            ))}
+          </div>
+        </div>
+      );
+    };
+
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>
