@@ -1,5 +1,5 @@
 import logger from '../utils/logger';
-import { Counter, Histogram, register } from 'prom-client';
+import { Counter, Histogram, Gauge, register } from 'prom-client';
 import fs from 'fs/promises';
 import axios from 'axios';
 import { Request, Response, NextFunction } from 'express';
@@ -42,7 +42,20 @@ const tradesExecuted = new Counter({
 });
 const signalsGenerated = new Counter({
   name: 'signals_generated_total',
-  helpBuffering log entries
+  help: 'Total signals generated',
+  labelNames: ['agent'],
+});
+// Новые метрики для ROI, win rate и balance
+const roiMetric = new Gauge({ name: 'roi_total', help: 'Total ROI across trades' });
+const winRateMetric = new Gauge({ name: 'win_rate', help: 'Trade win rate percentage' });
+const balanceMetric = new Gauge({ name: 'balance', help: 'Total wallet balance' });
+
+// Регистрация новых метрик
+register.registerMetric(roiMetric);
+register.registerMetric(winRateMetric);
+register.registerMetric(balanceMetric);
+
+// Buffering log entries
 class LogBuffer {
   private entries: string[] = [];
   private readonly maxSize = 1000;
@@ -112,7 +125,7 @@ async function authenticateJwtToken(req: Request, res: Response, next: NextFunct
 
 // Метрики
 function recordPrometheusMetric(
-  metric: Histogram<string> | Counter<string>,
+  metric: Histogram<string> | Counter<string> | Gauge<string>,
   labels: Record<string, string | number>,
   value?: number
 ): void {
@@ -120,6 +133,8 @@ function recordPrometheusMetric(
     metric.observe(labels, value);
   } else if ('inc' in metric) {
     metric.inc(labels);
+  } else if ('set' in metric && value !== undefined) {
+    metric.set(labels, value);
   }
 }
 
@@ -278,21 +293,9 @@ class SystemMaster {
       const balance = this.calculateBalance(wallets);
       const walletCount = wallets.length;
 
-      recordPrometheusMetric(new Histogram({
-        name: 'roi_total',
-        help: 'Total ROI across trades',
-        labelNames: ['component'],
-      }), { component: 'system' }, roi);
-      recordPrometheusMetric(new Histogram({
-        name: 'win_rate',
-        help: 'Trade win rate percentage',
-        labelNames: ['component'],
-      }), { component: 'system' }, winRate);
-      recordPrometheusMetric(new Histogram({
-        name: 'balance',
-        help: 'Total wallet balance',
-        labelNames: ['component'],
-      }), { component: 'system' }, balance);
+      recordPrometheusMetric(roiMetric, {}, roi);
+      recordPrometheusMetric(winRateMetric, {}, winRate);
+      recordPrometheusMetric(balanceMetric, {}, balance);
       recordPrometheusMetric(new Counter({
         name: 'wallets_count',
         help: 'Number of wallets',
@@ -342,7 +345,7 @@ class SystemMaster {
 
   private prepareDqnData(trades: any[]): { states: number[][], actions: number[][] } {
     const states = trades.map((trade: any) => {
-      const normalizedPrice = trade.price / 1000; // Пример нормализации
+      const normalizedPrice = trade.price / 1000;
       const normalizedVolume = trade.volume / 1000000;
       return [normalizedPrice, normalizedVolume, trade.roi, trade.positionSize, trade.executionTime];
     });
@@ -361,9 +364,7 @@ class SystemMaster {
         label: trade.explanation || 'No explanation provided',
       }));
 
-      // Локальное обучение DistilBERT
       const trainer = await pipeline('text-classification', 'distilbert-base-uncased');
-      // Имитация обучения (упрощенно, так как полное обучение требует GPU)
       logInfo('SYSTEMMASTER', 'Simulated LLM training with DistilBERT');
 
       await publish('models:updated', JSON.stringify({ model: 'llm', timestamp: new Date().toISOString() }));
