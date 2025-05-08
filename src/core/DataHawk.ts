@@ -1,218 +1,222 @@
-лimport * as tf from '@tensorflow/tfjs-node';
-import Redis from 'ioredis';
 import axios from 'axios';
-import { NewsSignal, Token } from '../utils/types';
-import { logInfoAggregated, logErrorAggregated } from './SystemGuard';
-import { retry } from '../utils/utils';
+import Redis from 'ioredis';
+import { NewsSignal, Token } from './utils/types';
+import { retry } from 'ts-retry-promise';
+import puppeteer from 'puppeteer';
+import * as cheerio from 'cheerio';
+import { CircuitBreaker } from 'opossum';
+import puppeteerExtra from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 
-// Интерфейс для DQN-агента
-interface DQNAgent {
-  train(signals: NewsSignal[], tokens: Token[]): Promise<void>;
-  predict(ticker: string, signal: NewsSignal): Promise<number>;
-  saveModel(): Promise<void>;
-  loadModel(): Promise<void>;
+puppeteerExtra.use(StealthPlugin());
+
+interface APISource {
+  url: string;
+  priority: number;
+  fallback: boolean;
 }
 
-class DQNTrainer implements DQNAgent {
-  private readonly redisClient: Redis;
-  private readonly axiosInstance: typeof axios;
-  private model: tf.Sequential;
-  private readonly stateSize = 6; // [sentimentScore, announcementImpact, confidence, fearGreedIndex, isWhale, strategy]
-  private readonly actionSize = 3; // [buy, sell, hold]
-  private readonly gamma = 0.95; // Discount factor
-  private readonly epsilon = 1.0; // Exploration rate
-  private readonly epsilonMin = 0.01;
-  private readonly epsilonDecay = 0.995;
-  private readonly learningRate = 0.001;
-  private readonly batchSize = 32;
-  private readonly memory: Array<{
-    state: number[];
-    action: number;
-    reward: number;
-    nextState: number[];
-    done: boolean;
-  }> = [];
-  private readonly memorySize = 1000;
+interface BrightDataProxy {
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+}
 
-  constructor(redisClient: Redis = new Redis(process.env.REDIS_URL!), axiosInstance: typeof axios = axios) {
+class DataHawk {
+  private redisClient: Redis;
+  private apiSources: APISource[] = [];
+  private circuitBreaker: CircuitBreaker;
+
+  constructor(redisClient: Redis) {
     this.redisClient = redisClient;
-    this.axiosInstance = axiosInstance;
-    this.model = this.createModel();
-    this.loadModel().catch(() => logInfoAggregated('DQN_TRAINER', 'No saved model found, starting fresh'));
-  }
-
-  private createModel(): tf.Sequential {
-    const model = tf.sequential();
-    model.add(
-      tf.layers.dense({
-        units: 64,
-        activation: 'relu',
-        inputShape: [this.stateSize],
-      })
-    );
-    model.add(tf.layers.dense({ units: 32, activation: 'relu' }));
-    model.add(tf.layers.dense({ units: this.actionSize, activation: 'linear' }));
-    model.compile({
-      optimizer: tf.train.adam(this.learningRate),
-      loss: 'meanSquaredError',
+    this.loadAPISources();
+    this.circuitBreaker = new CircuitBreaker({
+      errorThresholdPercentage: 50,
+      rollingCountTimeout: 10000,
     });
-    return model;
   }
 
-  private async getTokenPrice(ticker: string): Promise<number> {
+  private loadAPISources(): void {
+    this.apiSources = [
+      { url: 'https://api.raydium.io/v1/tokens', priority: 1, fallback: true },
+      { url: 'https://public-api.birdeye.so/v1/tokens', priority: 2, fallback: true },
+      { url: 'https://public-api.solscan.io/account/transactions', priority: 3, fallback: true },
+    ].sort((a, b) => a.priority - b.priority);
+  }
+
+  private async getBrightDataProxy(): Promise<BrightDataProxy> {
+    // Симуляция получения прокси через BrightData API
+    return {
+      host: 'brd.superproxy.io',
+      port: 22225,
+      username: process.env.BRIGHTDATA_USERNAME || 'brd-customer-username',
+      password: process.env.BRIGHTDATA_PASSWORD || 'password',
+    };
+  }
+
+  private async scrapeGMGN(): Promise<Token[]> {
+    const proxy = await this.getBrightDataProxy();
+    const browser = await puppeteerExtra.launch({
+      headless: 'new',
+      args: [
+        `--proxy-server=${proxy.host}:${proxy.port}`,
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+      ],
+    });
+    const page = await browser.newPage();
+    await page.authenticate({ username: proxy.username, password: proxy.password });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+    await page.goto('https://gmgn.ai/', { waitUntil: 'networkidle2' });
+
+    const content = await page.content();
+    const $ = cheerio.load(content);
+    const tokens: Token[] = [];
+
+    $('.token-item').each((i, el) => {
+      const ticker = $(el).find('.token-ticker').text();
+      const price = parseFloat($(el).find('.token-price').text());
+      if (ticker && !isNaN(price)) tokens.push({ ticker, price });
+    });
+
+    await browser.close();
+    return tokens;
+  }
+
+  private async scrapeRaydiumFallback(): Promise<Token[]> {
+    const browser = await puppeteerExtra.launch({ headless: 'new' });
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+    await page.goto('https://raydium.io/swap/', { waitUntil: 'networkidle2' });
+
+    const content = await page.content();
+    const $ = cheerio.load(content);
+    const tokens: Token[] = [];
+
+    $('.token-list-item').each((i, el) => {
+      const ticker = $(el).find('.token-symbol').text();
+      const price = parseFloat($(el).find('.token-price').text());
+      if (ticker && !isNaN(price)) tokens.push({ ticker, price });
+    });
+
+    await browser.close();
+    return tokens;
+  }
+
+  private async fetchAPIData(): Promise<Token[]> {
+    for (const source of this.apiSources) {
+      try {
+        const response = await this.circuitBreaker.fire(
+          () => retry(() => axios.get(source.url, { params: { apiKey: process.env.SOLSCAN_API_KEY } }), { retries: 3, delay: 1000 })
+        );
+        if (source.url.includes('solscan')) {
+          return response.data.map((item: any) => ({
+            ticker: item.tokenAddress ? item.tokenAddress.slice(0, 8) : 'unknown',
+            price: parseFloat(item.amount || 0) / 1e9, // Нормализация SOL
+          }));
+        }
+        return response.data.map((item: any) => ({
+          ticker: item.symbol || item.name || 'unknown',
+          price: parseFloat(item.price || 0),
+        }));
+      } catch (error) {
+        console.error(`API ${source.url} failed: ${error.message}`);
+        if (!source.fallback) continue;
+      }
+    }
+    // Резервный скрапинг Raydium
+    return await this.scrapeRaydiumFallback();
+  }
+
+  async fetchTwitterPosts(): Promise<{ posts: NewsSignal[] }> {
+    const cacheKey = 'twitter:posts';
+    const cached = await this.redisClient.get(cacheKey);
+    if (cached) return JSON.parse(cached);
+
+    const posts: NewsSignal[] = [];
     try {
       const response = await retry(
         () =>
-          this.axiosInstance.get('https://api.raydium.io/v2/tokens', {
-            headers: { Authorization: `Bearer ${process.env.RAYDIUM_API_KEY}` },
+          axios.get('https://api.twitter.com/2/tweets/search/recent', {
+            headers: { Authorization: `Bearer ${process.env.TWITTER_BEARER_TOKEN}` },
+            params: {
+              query: '#Solana OR #memecoin whale -is:retweet',
+              max_results: 500,
+              'tweet.fields': 'created_at',
+            },
           }),
-        { retries: 3 }
+        { retries: 3, delay: 1000 }
       );
-      const token = response.data.find((t: any) => t.symbol === ticker);
-      return token ? Number(token.price) : 0;
+      posts.push(
+        ...response.data.data.map((tweet: any) => ({
+          text: tweet.text,
+          timestamp: new Date(tweet.created_at).getTime(),
+          source: 'twitter',
+        }))
+      );
     } catch (error) {
-      logErrorAggregated('DQN_TRAINER', `Failed to fetch price for ${ticker}: ${error.message}`);
-      return 0;
-    }
-  }
-
-  private getState(signal: NewsSignal): number[] {
-    const strategyValue = signal.strategy
-      ? { pump: 1, dump: -1, fomo: 0.5 }[signal.strategy] || 0
-      : 0;
-    return [
-      signal.sentimentScore,
-      signal.announcementImpact,
-      signal.confidence,
-      signal.fearGreedIndex / 100,
-      signal.isWhale ? 1 : 0,
-      strategyValue,
-    ];
-  }
-
-  private calculateReward(currentPrice: number, nextPrice: number, action: number): number {
-    const priceChange = nextPrice - currentPrice;
-    if (action === 0) return priceChange > 0 ? priceChange : -priceChange; // Buy
-    if (action === 1) return priceChange < 0 ? -priceChange : priceChange; // Sell
-    return -Math.abs(priceChange) * 0.1; // Hold (small penalty)
-  }
-
-  async train(signals: NewsSignal[], tokens: Token[]): Promise<void> {
-    if (signals.length < 2) {
-      logInfoAggregated('DQN_TRAINER', 'Not enough signals to train');
-      return;
+      console.error(`Twitter fetch failed: ${error.message}`);
     }
 
-    try {
-      for (let i = 0; i < signals.length - 1; i++) {
-        const signal = signals[i];
-        const nextSignal = signals[i + 1];
-        const token = tokens.find((t) => t.ticker === signal.ticker);
-        if (!token) continue;
-
-        const currentPrice = await this.getTokenPrice(signal.ticker);
-        const nextPrice = await this.getTokenPrice(nextSignal.ticker);
-        if (currentPrice === 0 || nextPrice === 0) continue;
-
-        const state = this.getState(signal);
-        const nextState = this.getState(nextSignal);
-        const action = Math.random() < this.epsilon ? Math.floor(Math.random() * this.actionSize) : await this.getBestAction(state);
-        const reward = this.calculateReward(currentPrice, nextPrice, action);
-        const done = i === signals.length - 2;
-
-        this.memory.push({ state, action, reward, nextState, done });
-        if (this.memory.length > this.memorySize) this.memory.shift();
-
-        if (this.memory.length >= this.batchSize) {
-          const batch = this.memory.slice(-this.batchSize);
-          const states = tf.tensor2d(batch.map((m) => m.state));
-          const nextStates = tf.tensor2d(batch.map((m) => m.nextState));
-          const rewards = batch.map((m) => m.reward);
-          const actions = batch.map((m) => m.action);
-          const dones = batch.map((m) => m.done);
-
-          const qValues = this.model.predict(states) as tf.Tensor;
-          const nextQValues = this.model.predict(nextStates) as tf.Tensor;
-          const qValuesArray = await qValues.array();
-          const nextQValuesArray = await nextQValues.array();
-
-          const targets = qValuesArray.map((q, idx) => {
-            const maxNextQ = Math.max(...nextQValuesArray[idx]);
-            return dones[idx] ? rewards[idx] : rewards[idx] + this.gamma * maxNextQ;
-          });
-
-          const updatedQValues = qValuesArray.map((q, idx) => {
-            q[actions[idx]] = targets[idx];
-            return q;
-          });
-
-          await this.model.fit(states, tf.tensor2d(updatedQValues), {
-            epochs: 1,
-            batchSize: this.batchSize,
-            verbose: 0,
-          });
-
-          states.dispose();
-          nextStates.dispose();
-          qValues.dispose();
-          nextQValues.dispose();
-        }
-      }
-
-      this.epsilon = Math.max(this.epsilonMin, this.epsilon * this.epsilonDecay);
-      logInfoAggregated('DQN_TRAINER', `Trained model, epsilon: ${this.epsilon}`);
-    } catch (error) {
-      logErrorAggregated('DQN_TRAINER', `Training failed: ${error.message}`);
-    }
+    await this.redisClient.setEx(cacheKey, 900, JSON.stringify({ posts })); // 15 минут
+    return { posts };
   }
 
-  private async getBestAction(state: number[]): Promise<number> {
-    const stateTensor = tf.tensor2d([state]);
-    const qValues = this.model.predict(stateTensor) as tf.Tensor;
-    const qValuesArray = await qValues.array();
-    stateTensor.dispose();
-    qValues.dispose();
-    return qValuesArray[0].indexOf(Math.max(...qValuesArray[0]));
+  async fetchTweetcordSignals(): Promise<NewsSignal[]> {
+    const cacheKey = 'tweetcord:signals';
+    const cached = await this.redisClient.get(cacheKey);
+    if (cached) return JSON.parse(cached);
+
+    const useDiscord = false;
+    let signals: NewsSignal[] = [];
+
+    if (useDiscord) {
+      const channelId = '123456789';
+      signals = [{ text: '123456789', timestamp: Date.now(), source: 'discord' }];
+    }
+
+    const twitterSignals = await this.fetchTwitterPosts().then((result) => result.posts);
+    signals = signals.concat(twitterSignals);
+
+    await this.redisClient.setEx(cacheKey, 600, JSON.stringify(signals)); // 10 минут
+    return signals;
   }
 
-  async predict(ticker: string, signal: NewsSignal): Promise<number> {
-    try {
-      const state = this.getState(signal);
-      const action = await this.getBestAction(state);
-      logInfoAggregated('DQN_TRAINER', `Predicted action for ${ticker}: ${['buy', 'sell', 'hold'][action]}`);
-      return action;
-    } catch (error) {
-      logErrorAggregated('DQN_TRAINER', `Prediction failed for ${ticker}: ${error.message}`);
-      return 2; // Default to hold
-    }
+  async generateSignals(): Promise<NewsSignal[]> {
+    const [gmgnTokens, apiTokens, tweetcordSignals] = await Promise.all([
+      this.scrapeGMGN(),
+      this.fetchAPIData(),
+      this.fetchTweetcordSignals(),
+    ]);
+
+    // Устранение дубликатов токенов
+    const tokenMap = new Map<string, Token>();
+    [...gmgnTokens, ...apiTokens].forEach(token => {
+      if (!tokenMap.has(token.ticker)) tokenMap.set(token.ticker, token);
+    });
+    const allTokens = Array.from(tokenMap.values()).map(token => ({
+      ...token,
+      source: 'gmgn' in token ? 'gmgn' : 'api',
+    }));
+
+    await this.redisClient.setEx('tokens:new', 300, JSON.stringify(allTokens));
+    await this.redisClient.publish('tokens:new', JSON.stringify(allTokens));
+
+    const signals: NewsSignal[] = tweetcordSignals.map(signal => {
+      const tickerMatch = signal.text.match(/\b[A-Z]{3,}\b/); // Поиск токена без $
+      const ticker = signal.text.split(' ').find(w => w.startsWith('$'))?.slice(1) || tickerMatch?.[0] || '';
+      return { ...signal, ticker };
+    });
+
+    await this.redisClient.setEx('news:signals', 3600, JSON.stringify(signals));
+    await this.redisClient.publish('news:signals', JSON.stringify(signals));
+    return signals;
   }
 
-  async saveModel(): Promise<void> {
-    try {
-      const modelJson = await this.model.toJSON();
-      await this.redisClient.set('dqn_model', JSON.stringify(modelJson));
-      logInfoAggregated('DQN_TRAINER', 'Model saved to Redis');
-    } catch (error) {
-      logErrorAggregated('DQN_TRAINER', `Failed to save model: ${error.message}`);
-    }
-  }
-
-  async loadModel(): Promise<void> {
-    try {
-      const modelJson = await this.redisClient.get('dqn_model');
-      if (modelJson) {
-        const parsed = JSON.parse(modelJson);
-        this.model = await tf.models.modelFromJSON(parsed);
-        this.model.compile({
-          optimizer: tf.train.adam(this.learningRate),
-          loss: 'meanSquaredError',
-        });
-        logInfoAggregated('DQN_TRAINER', 'Model loaded from Redis');
-      }
-    } catch (error) {
-      logErrorAggregated('DQN_TRAINER', `Failed to load model: ${error.message}`);
-    }
+  async start(): Promise<void> {
+    setInterval(() => this.generateSignals(), 300000);
   }
 }
 
-export default DQNTrainer;
+export default DataHawk;
