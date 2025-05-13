@@ -10,12 +10,13 @@ import { TokenBucket } from 'limiter';
 import promClient from 'prom-client';
 import { Connection, PublicKey } from '@solana/web3.js';
 import { gzipSync, gunzipSync } from 'zlib';
+import axios from 'axios';
 import { FilterGuard } from './FilterGuard';
 import { TradeGenix } from './TradeGenix';
 import { Orchestrator } from './Orchestrator';
 import { aiClients } from './index';
-import { logger } from './logger';
-import { tradeRoi } from './metrics';
+import { logger } from '../utils/logger';
+import { tradeRoi, telegramApiErrors, telegramCheckLatency } from '../utils/metrics';
 
 // --- Metrics ---
 const webhookProcessingMs = new promClient.Histogram({
@@ -45,6 +46,18 @@ interface Token {
   priceChange: number;
 }
 
+interface NewsDetails {
+  marketCap?: number;
+  liquidity?: number;
+  snipers?: number;
+  category?: string;
+  channel?: string;
+  socialVolume?: number;
+  socialScore?: number;
+  galaxyScore?: number;
+  announcementImpact?: number;
+}
+
 interface Dependencies {
   filterGuard: typeof FilterGuard;
   tradeGenix: typeof TradeGenix;
@@ -58,6 +71,7 @@ const mongoClient = new MongoClient(process.env.MONGO_URI!);
 const telegramBot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN!, { polling: false });
 const webhookQueue = new Bull('webhook-queue', process.env.REDIS_URL!);
 const redisSignalQueue = new Bull('redis-signal-queue', process.env.REDIS_URL!);
+const telegramQueue = new Bull('telegram-queue', process.env.REDIS_URL!);
 const router = express.Router();
 const webhookSchema = Joi.object({
   ticker: Joi.string().required(),
@@ -66,6 +80,12 @@ const webhookSchema = Joi.object({
   strategy: Joi.string().required(),
   signature: Joi.string().required(),
 });
+/**
+ * Maps TradingView strategies to FilterGuard filters for signal validation.
+ * - RSI: Uses `trending_5min` for short-term trend signals (volume > 35k, price change < -15%).
+ * - MACD: Uses `nextbc_5min` for breakout signals (volume > 25k, price change > 20%).
+ * - Bollinger: Uses `swing_sniper` for swing trading (volume > 40k, price change > 10%).
+ */
 const strategyToFilter: Record<string, string> = {
   RSI: 'trending_5min',
   MACD: 'nextbc_5min',
@@ -79,6 +99,39 @@ const huggingFaceBreaker = new CircuitBreaker(aiClients.huggingface.query, {
 const telegramLimiter = new TokenBucket({ capacity: 20, fillRate: 20 / 60 });
 let tradeBuffer: any[] = [];
 const solanaConnection = new Connection('https://api.mainnet-beta.solana.com');
+const rpcPool = [
+  'https://api.mainnet-beta.solana.com',
+  'https://rpc.ankr.com/solana',
+  'https://solana-rpc.projectserum.com',
+];
+let currentRpcIndex = 0;
+
+// --- Telegram Queue Processor ---
+telegramQueue.process(async (job) => {
+  const { message, token, chatId } = job.data;
+  const errorKey = `telegram:error:${chatId}`;
+  const errorCountKey = `telegram:error:count:${chatId}`;
+  const start = Date.now();
+  try {
+    await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
+      chat_id: chatId,
+      text: message,
+      parse_mode: 'Markdown',
+    });
+    telegramCheckLatency.observe({ ticker: '' }, (Date.now() - start) / 1000);
+    await redisClient.del(errorKey);
+    await redisClient.del(errorCountKey);
+    logger.info({ component: 'WEBHOOK_AGENT', message: `Sent Telegram notification to ${chatId}` });
+  } catch (error) {
+    telegramApiErrors.inc({ ticker: '' });
+    const errorCount = parseInt(await redisClient.get(errorCountKey) || '0') + 1;
+    const ttl = Math.min(60 * Math.pow(2, errorCount - 1), 300); // Exponential backoff: 60s, 120s, 240s, max 300s
+    await redisClient.setEx(errorKey, ttl, 'true');
+    await redisClient.setEx(errorCountKey, ttl, errorCount.toString());
+    logger.error({ component: 'WEBHOOK_AGENT', message: `Ошибка Telegram уведомления: ${error.message}, backoff TTL: ${ttl}s` });
+    throw error;
+  }
+});
 
 // --- MongoDB Batch Insert ---
 setInterval(async () => {
@@ -100,8 +153,10 @@ setInterval(async () => {
     webhookQueueSize.set(size);
     if (size > 100) {
       await telegramLimiter.removeTokens(1);
-      await retry(() =>
-        telegramBot.sendMessage(process.env.TELEGRAM_CHAT_ID!, `⚠️ Webhook queue size: ${size}`)
+      await WebhookSignalProcessor.notifyTelegram(
+        `⚠️ Webhook queue size: ${size}`,
+        process.env.TELEGRAM_BOT_TOKEN!,
+        process.env.TELEGRAM_CHAT_ID!
       );
       logger.warn({ component: 'WEBHOOK_AGENT', message: `Queue size exceeded: ${size}` });
     }
@@ -129,11 +184,20 @@ async function cacheTokenPrice(ticker: string): Promise<number> {
     logger.info({ component: 'WEBHOOK_AGENT', message: `Solana price cache hit for ${ticker}` });
     return parseFloat(cachedPrice);
   }
-  // Placeholder: Implement actual price fetching logic based on token mint address
-  const price = 100; // Mock price (replace with real Solana RPC call)
-  await redisClient.setEx(cacheKey, 60, price.toString());
-  logger.info({ component: 'WEBHOOK_AGENT', message: `Cached Solana price for ${ticker}: ${price}` });
-  return price;
+  for (let i = 0; i < rpcPool.length; i++) {
+    try {
+      const connection = new Connection(rpcPool[currentRpcIndex]);
+      const price = 100; // Mock price (replace with real Solana RPC call, e.g., Raydium AMM)
+      await redisClient.setEx(cacheKey, 60, price.toString());
+      await redisClient.set(`rpc:priority:${rpcPool[currentRpcIndex]}`, Date.now());
+      logger.info({ component: 'WEBHOOK_AGENT', message: `Fetched price ${price} from ${rpcPool[currentRpcIndex]}` });
+      return price;
+    } catch (error) {
+      logger.warn({ component: 'WEBHOOK_AGENT', message: `RPC ${rpcPool[currentRpcIndex]} failed: ${error.message}` });
+      currentRpcIndex = (currentRpcIndex + 1) % rpcPool.length;
+    }
+  }
+  throw new Error('All RPC nodes failed');
 }
 
 // --- Adaptive Position Size ---
@@ -216,7 +280,7 @@ async function generateAndValidateTrade(
       wallet: { id: 'webhook-wallet' },
       filter,
     });
-    return trade.action !== 'hold' && action === trade.action ? { trade, huggingFaceRecommendation: recommendation } : null;
+    return trade.action !== 'hold' && action === trade.action ? { trade pronouns: recommendation } : null;
   }
   const prompt = `Оцени сигнал TradingView для ${token.ticker}: ${token.price} (стратегия: ${strategy}). Рекомендация: buy, sell или hold?`;
   let huggingFaceRecommendation: string;
@@ -243,6 +307,42 @@ async function generateAndValidateTrade(
   return trade.action !== 'hold' && action === trade.action ? { trade, huggingFaceRecommendation } : null;
 }
 
+async function fetchNewsDetails(ticker: string): Promise<NewsDetails> {
+  const cacheKey = `news:details:${ticker}`;
+  const cachedDetails = await redisClient.get(cacheKey);
+  if (cachedDetails) {
+    logger.info({ component: 'WEBHOOK_AGENT', message: `News details cache hit for ${ticker}` });
+    return JSON.parse(cachedDetails);
+  }
+  // Placeholder: DataHawk.ts fills news:details:${ticker} with marketCap, liquidity, etc.
+  const details: NewsDetails = {};
+  await redisClient.setEx(cacheKey, 300, JSON.stringify(details));
+  return details;
+}
+
+async function formatTelegramMessage(
+  action: string,
+  ticker: string,
+  price: number,
+  strategy: string,
+  newsDetails: NewsDetails
+): Promise<string> {
+  let message = `📡 TradingView: ${action.toUpperCase()} ${ticker} @ $${price} (Стратегия: ${strategy})`;
+  if (Object.keys(newsDetails).length > 0) {
+    message += `\n*Контекст*:`;
+    if (newsDetails.marketCap) message += `\n- Market Cap: $${(newsDetails.marketCap / 1e6).toFixed(2)}M`;
+    if (newsDetails.liquidity) message += `\n- Liquidity: $${(newsDetails.liquidity / 1e6).toFixed(2)}M`;
+    if (newsDetails.snipers) message += `\n- Snipers: ${newsDetails.snipers}`;
+    if (newsDetails.category) message += `\n- Category: ${newsDetails.category}`;
+    if (newsDetails.channel) message += `\n- Channel: ${newsDetails.channel}`;
+    if (newsDetails.socialVolume) message += `\n- Social Volume: ${newsDetails.socialVolume}`;
+    if (newsDetails.socialScore) message += `\n- Social Score: ${newsDetails.socialScore}`;
+    if (newsDetails.galaxyScore) message += `\n- Galaxy Score: ${newsDetails.galaxyScore}`;
+    if (newsDetails.announcementImpact) message += `\n- Announcement Impact: ${(newsDetails.announcementImpact * 100).toFixed(1)}%`;
+  }
+  return message;
+}
+
 async function executeAndNotifyTrade(
   trade: any,
   ticker: string,
@@ -257,8 +357,12 @@ async function executeAndNotifyTrade(
   try {
     await dependencies.orchestrator.executeSwap(inputToken, outputToken, trade.positionSize);
   } catch (error) {
-    await retry(() =>
-      telegramBot.sendMessage(process.env.TELEGRAM_CHAT_ID!, `⚠️ Ошибка сделки ${ticker}: ${error.message}`)
+    await telegramLimiter.removeTokens(1);
+    const message = `⚠️ Ошибка сделки ${ticker}: ${error.message}`;
+    await WebhookSignalProcessor.notifyTelegram(
+      message,
+      process.env.TELEGRAM_BOT_TOKEN!,
+      process.env.TELEGRAM_CHAT_ID!
     );
     logger.error({ component: 'WEBHOOK_AGENT', message: `Swap failed: ${error.message}` });
     throw error;
@@ -276,9 +380,14 @@ async function executeAndNotifyTrade(
     tradeBuffer = [];
   }
   tradeRoi.observe({ filter: trade.filter, ticker: trade.ticker }, trade.roi);
-  const message = `📡 TradingView: ${trade.action.toUpperCase()} ${ticker} @ $${price} (Стратегия: ${strategy})`;
+  const newsDetails = await fetchNewsDetails(ticker);
+  const message = await formatTelegramMessage(trade.action, ticker, price, strategy, newsDetails);
   await telegramLimiter.removeTokens(1);
-  await retry(() => telegramBot.sendMessage(process.env.TELEGRAM_CHAT_ID!, message));
+  await WebhookSignalProcessor.notifyTelegram(
+    message,
+    process.env.TELEGRAM_BOT_TOKEN!,
+    process.env.TELEGRAM_CHAT_ID!
+  );
   const compressedTrade = gzipSync(Buffer.from(JSON.stringify(trade))).toString('base64');
   await redisClient.publish('trades:executed', compressedTrade);
   logger.info({ component: 'WEBHOOK_AGENT', message: `Executed ${trade.action} for ${ticker}, compressed size: ${compressedTrade.length}` });
@@ -292,6 +401,17 @@ interface SignalProcessor {
 
 class WebhookSignalProcessor implements SignalProcessor {
   constructor(private dependencies: Dependencies) {}
+
+  static async notifyTelegram(message: string, token: string, chatId: string): Promise<void> {
+    const errorKey = `telegram:error:${chatId}`;
+    const hasRecentError = await redisClient.get(errorKey);
+    if (hasRecentError) {
+      logger.warn({ component: 'WEBHOOK_AGENT', message: `Skipping Telegram notification for ${chatId} due to recent error` });
+      return;
+    }
+    await telegramQueue.add({ message, token, chatId });
+    logger.info({ component: 'WEBHOOK_AGENT', message: `Added Telegram notification to queue for ${chatId}` });
+  }
 
   async processWebhook(payload: WebhookPayload): Promise<void> {
     const { error } = webhookSchema.validate(payload);
@@ -312,9 +432,14 @@ class WebhookSignalProcessor implements SignalProcessor {
 
   async processRedisSignal(signal: any): Promise<void> {
     const { ticker, action, price } = signal;
-    const message = `🔔 Новый сигнал: ${action.toUpperCase()} ${ticker} @ $${price}`;
+    const newsDetails = await fetchNewsDetails(ticker);
+    const message = await formatTelegramMessage(action, ticker, price, 'Redis', newsDetails);
     await telegramLimiter.removeTokens(1);
-    await retry(() => telegramBot.sendMessage(process.env.TELEGRAM_CHAT_ID!, message));
+    await WebhookSignalProcessor.notifyTelegram(
+      message,
+      process.env.TELEGRAM_BOT_TOKEN!,
+      process.env.TELEGRAM_CHAT_ID!
+    );
     const compressedSignal = gzipSync(Buffer.from(JSON.stringify({ ticker, action, price, source: 'signals:new' }))).toString('base64');
     await redisClient.publish('tradingview:webhooks', compressedSignal);
     logger.info({ component: 'WEBHOOK_AGENT', message: `Notified signal for ${ticker}, compressed size: ${compressedSignal.length}` });
@@ -357,11 +482,11 @@ webhookQueue.process(async (job) => {
     const duration = timer();
     if (duration > 5000) {
       await telegramLimiter.removeTokens(1);
-      await retry(() =>
-        telegramBot.sendMessage(
-          process.env.TELEGRAM_CHAT_ID!,
-          `⚠️ High webhook processing time: ${duration.toFixed(2)}ms for ${ticker}`
-        )
+      const message = `⚠️ High webhook processing time: ${duration.toFixed(2)}ms for ${ticker}`;
+      await WebhookSignalProcessor.notifyTelegram(
+        message,
+        process.env.TELEGRAM_BOT_TOKEN!,
+        process.env.TELEGRAM_CHAT_ID!
       );
       logger.warn({ component: 'WEBHOOK_AGENT', message: `High processing time: ${duration}ms for ${ticker}` });
     }
