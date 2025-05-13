@@ -1,16 +1,14 @@
 import Redis from 'ioredis';
 import { Jupiter } from '@jup-ag/api';
 import FilterGuard from './FilterGuard';
-import { logInfo, logError } from './SystemGuard';
+import { logInfo, logError, sendTelegramAlert } from './SystemGuard';
 import { queryDeepSeek, queryOpenAI } from './LearnMaster';
 import { retry, circuitBreaker } from '../utils/utils';
-import { Token, Trade, Wallet } from '../utils/types';
+import { Token, Trade, Wallet, Signal } from '../types';
 import { connectDB } from '../db/mongo';
 import axios from 'axios';
-import { Counter } from 'prometheus-client';
-
-const tradeSuccess = new Counter({ name: 'trade_success', help: 'Successful trades', labelNames: ['filter', 'ticker'] });
-const tradeFailure = new Counter({ name: 'trade_failure', help: 'Failed trades', labelNames: ['filter', 'error'] });
+import { register } from 'prom-client';
+import { tradeSuccess, tradeFailure, telegramApiErrors, telegramSignalsProcessed, telegramCheckLatency } from '../utils/metrics';
 
 const redisClient = new Redis(process.env.REDIS_URL!, {
   maxRetriesPerRequest: 3,
@@ -18,9 +16,10 @@ const redisClient = new Redis(process.env.REDIS_URL!, {
 });
 const jupiter = new Jupiter({ basePath: 'https://quote-api.jup.ag/v6' });
 
-interface TradeValidationResult {
-  isValid: boolean;
-  error?: string;
+interface TrailingStopConfig {
+  maxPrice: number;
+  stopLossPercent: number;
+  nextFibonacciLevel: number;
 }
 
 class Orchestrator {
@@ -31,6 +30,22 @@ class Orchestrator {
     errorThreshold: 50,
     resetTimeout: 30000,
   });
+  private readonly closeTradeBreaker = circuitBreaker(this.closeTrade.bind(this), {
+    timeout: 5000,
+    errorThreshold: 50,
+    resetTimeout: 30000,
+  });
+  private readonly notifyTelegramBreaker = circuitBreaker(this.notifyTelegram.bind(this), {
+    timeout: 3000,
+    errorThreshold: 50,
+    resetTimeout: 30000,
+  });
+  private readonly reinvestBreaker = circuitBreaker(this.reinvest.bind(this), {
+    timeout: 5000,
+    errorThreshold: 50,
+    resetTimeout: 30000,
+  });
+  private trailingStops: Map<string, TrailingStopConfig> = new Map();
 
   constructor() {
     this.filterGuard = new FilterGuard();
@@ -39,8 +54,27 @@ class Orchestrator {
   }
 
   private async initialize(): Promise<void> {
+    await this.checkDependencies();
     await this.loadApiSources();
     this.subscribeToSignals();
+  }
+
+  private async checkDependencies(): Promise<void> {
+    try {
+      await redisClient.ping();
+      logInfo('ORCHESTRATOR', 'Redis connection successful');
+    } catch (error) {
+      logError('ORCHESTRATOR', `Redis connection failed: ${(error as Error).message}`);
+      throw new Error('Redis unavailable');
+    }
+    try {
+      const db = await connectDB();
+      await db.command({ ping: 1 });
+      logInfo('ORCHESTRATOR', 'MongoDB connection successful');
+    } catch (error) {
+      logError('ORCHESTRATOR', `MongoDB connection failed: ${(error as Error).message}`);
+      throw new Error('MongoDB unavailable');
+    }
   }
 
   private async loadApiSources(): Promise<void> {
@@ -56,6 +90,35 @@ class Orchestrator {
       logInfo('ORCHESTRATOR', 'API sources loaded from file');
     } catch (error) {
       logError('ORCHESTRATOR', `Failed to load API sources: ${(error as Error).message}`);
+    }
+  }
+
+  private isValidSentimentSignal(signal: Signal): boolean {
+    return !(signal.entryType === 'sentiment' && (!signal.socialScore || signal.socialScore < 0.8));
+  }
+
+  async coordinateAgents(signal: Signal): Promise<void> {
+    if (signal.entryType === 'fibonacci') {
+      await redisClient.lpush(`signals:tradesensei:high_priority`, JSON.stringify(signal));
+      logInfo('ORCHESTRATOR', `Prioritized fibonacci signal for ${signal.ticker}`);
+    } else {
+      await redisClient.lpush(`signals:tradesensei:low_priority`, JSON.stringify(signal));
+      logInfo('ORCHESTRATOR', `Sent ${signal.entryType} signal for ${signal.ticker}`);
+    }
+    telegramSignalsProcessed.inc({ ticker: signal.ticker });
+  }
+
+  async monitorFibonacciStrategy(): Promise<{ efficiency: number }> {
+    try {
+      const signalsCount = register.getSingleMetric('datahawk_signals_generated_total')?.get()?.values.find(v => v.labels.source === 'fibonacci')?.value || 0;
+      const exitsCount = register.getSingleMetric('trades_fibonacci_exits_total')?.get()?.values.reduce((sum, v) => sum + v.value, 0) || 0;
+      const efficiency = signalsCount > 0 ? exitsCount / signalsCount : 0;
+      logInfo('ORCHESTRATOR', `Fibonacci strategy efficiency: ${(efficiency * 100).toFixed(2)}%`);
+      await this.notifyTelegramBreaker.fire(`Fibonacci strategy efficiency: ${(efficiency * 100).toFixed(2)}%`);
+      return { efficiency };
+    } catch (error) {
+      logError('ORCHESTRATOR', `Fibonacci strategy monitoring error: ${(error as Error).message}`);
+      return { efficiency: 0 };
     }
   }
 
@@ -88,10 +151,31 @@ class Orchestrator {
       return this.handleSignalConflict(token.ticker, signals);
     }
     if (signals.length === 1) {
-      const trade = JSON.parse(signals[0]);
-      return this.validateTrade(trade);
+      const signal: Signal = JSON.parse(signals[0]);
+      if ((signal.entryType === 'fibonacci' || signal.entryType === 'sentiment') && signal.action === 'buy' && this.isValidSentimentSignal(signal)) {
+        const trade = this.createTradeFromSignal(signal, token);
+        return this.validateTrade(trade);
+      }
     }
     return null;
+  }
+
+  private createTradeFromSignal(signal: Signal, token: Token): Trade {
+    return {
+      ticker: signal.ticker,
+      action: signal.action,
+      positionSize: this.calculatePositionSize(token),
+      price: token.price,
+      walletId: this.wallets[0].walletId,
+      timestamp: new Date().toISOString(),
+      entryType: signal.entryType,
+      fibonacciLevel: signal.fibonacciLevel || token.fibonacciLevels?.level_382 || 0,
+    };
+  }
+
+  private calculatePositionSize(token: Token): number {
+    const liquidity = token.liquidity || 100000;
+    return Math.min(0.008 * liquidity, this.wallets[0].balance * 0.1);
   }
 
   private async handleSignalConflict(ticker: string, signals: string[]): Promise<Trade | null> {
@@ -138,7 +222,9 @@ class Orchestrator {
       const quote = await this.getTradeQuote(trade);
       const swap = await this.performSwap(quote, trade);
       await this.updateWalletAndLogTrade(trade, wallet, quote);
-      await this.reinvest(trade);
+      await this.setTrailingStop(trade);
+      await this.reinvestBreaker.fire(trade);
+      await this.notifyTelegramBreaker.fire(`Trade executed: ${trade.ticker} ${trade.action} at ${trade.price}, size: ${trade.positionSize}`);
     } catch (error) {
       tradeFailure.inc({ filter: 'SwingSniper', error: (error as Error).message });
       logError('ORCHESTRATOR', `Trade execution failed: ${(error as Error).message}`);
@@ -171,6 +257,75 @@ class Orchestrator {
     logInfo('ORCHESTRATOR', `Executed trade: ${trade.ticker} ${trade.action}`);
   }
 
+  private async setTrailingStop(trade: Trade): Promise<void> {
+    const token = JSON.parse((await redisClient.get(`tokens:${trade.ticker}`)) || '{}');
+    const fibonacciLevels = token.fibonacciLevels || {};
+    const nextFibonacciLevel = this.getNextFibonacciLevel(trade.fibonacciLevel, fibonacciLevels);
+    this.trailingStops.set(trade.ticker, {
+      maxPrice: trade.price,
+      stopLossPercent: 0.15,
+      nextFibonacciLevel,
+    });
+    this.monitorTrailingStop(trade);
+  }
+
+  private getNextFibonacciLevel(currentLevel: number, levels: Token['fibonacciLevels']): number {
+    if (!levels) return 0;
+    const fibLevels = [levels.level_236, levels.level_382, levels.level_500, levels.level_618];
+    const currentIndex = fibLevels.indexOf(currentLevel);
+    return currentIndex < fibLevels.length - 1 ? fibLevels[currentIndex + 1] : levels.level_618;
+  }
+
+  private async monitorTrailingStop(trade: Trade): Promise<void> {
+    const stopConfig = this.trailingStops.get(trade.ticker);
+    if (!stopConfig) return;
+    try {
+      const token = JSON.parse((await redisClient.get(`tokens:${trade.ticker}`)) || '{}');
+      const currentPrice = token.price || trade.price;
+      if (currentPrice > stopConfig.maxPrice) {
+        stopConfig.maxPrice = currentPrice;
+        this.trailingStops.set(trade.ticker, stopConfig);
+      }
+      const stopPrice = stopConfig.maxPrice * (1 - stopConfig.stopLossPercent);
+      const exitReason = currentPrice <= stopPrice ? 'trailingStop' : currentPrice <= stopConfig.nextFibonacciLevel ? 'fibonacciLevel' : null;
+      if (exitReason) {
+        await this.closeTradeBreaker.fire(trade, exitReason);
+        this.trailingStops.delete(trade.ticker);
+      }
+    } catch (error) {
+      logError('ORCHESTRATOR', `Trailing stop monitor error: ${(error as Error).message}`);
+    }
+  }
+
+  private async closeTrade(trade: Trade, exitReason: 'trailingStop' | 'fibonacciLevel'): Promise<void> {
+    try {
+      const token = JSON.parse((await redisClient.get(`tokens:${trade.ticker}`)) || '{}');
+      const quote = await jupiter.quote({
+        inputMint: trade.ticker,
+        outputMint: 'SOL',
+        amount: trade.positionSize * 1e9,
+        slippageBps: 50,
+      });
+      const swap = await jupiter.swap({
+        quoteResponse: quote,
+        userPublicKey: process.env.WALLET_PUBLIC_KEY!,
+        wrapAndUnwrapSol: true,
+      });
+      const wallet = this.wallets.find((w) => w.walletId === trade.walletId)!;
+      wallet.balance += quote.outAmount / 1e9;
+      trade.exitReason = exitReason;
+      trade.roi = ((quote.outAmount / 1e9 - trade.price) / trade.price) * 100;
+      const db = await connectDB();
+      await db.collection('trades').updateOne({ ticker: trade.ticker, timestamp: trade.timestamp }, { $set: trade });
+      await redisClient.publish('trades:executed', JSON.stringify(trade));
+      await this.notifyTelegramBreaker.fire(`Trade closed: ${trade.ticker}, exit: ${exitReason}, ROI: ${trade.roi.toFixed(2)}%`);
+      logInfo('ORCHESTRATOR', `Closed trade: ${trade.ticker} with ${exitReason}`);
+    } catch (error) {
+      logError('ORCHESTRATOR', `Close trade error: ${(error as Error).message}`);
+      throw error;
+    }
+  }
+
   async manageWallets(): Promise<void> {
     try {
       const totalBalance = this.calculateTotalBalance();
@@ -191,15 +346,20 @@ class Orchestrator {
     this.wallets.push({ walletId: 'wallet2', balance: newWalletBalance, type: 'trading' });
     this.wallets[0].balance = newWalletBalance;
     await redisClient.publish('wallets:updated', JSON.stringify(this.wallets));
-    await this.notifyTelegram(`Новый кошелек создан: wallet2, баланс: ${newWalletBalance}`);
+    await this.notifyTelegramBreaker.fire(`New wallet created: wallet2, balance: ${newWalletBalance}`);
     logInfo('ORCHESTRATOR', 'Created new wallet');
   }
 
   private async notifyTelegram(message: string): Promise<void> {
-    await axios.post(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      chat_id: process.env.TELEGRAM_CHAT_ID,
-      text: message,
-    });
+    const startTime = Date.now();
+    try {
+      await sendTelegramAlert(message, process.env.TELEGRAM_CHAT_ID!);
+      telegramCheckLatency.observe({ ticker: '' }, (Date.now() - startTime) / 1000);
+    } catch (error) {
+      telegramApiErrors.inc({ ticker: '' });
+      logError('ORCHESTRATOR', `Telegram notification error: ${(error as Error).message}`);
+      throw error;
+    }
   }
 
   private async reinvest(trade: Trade): Promise<void> {
@@ -213,6 +373,7 @@ class Orchestrator {
       logInfo('ORCHESTRATOR', `Reinvested ${reinvestAmount}, banked ${bankAmount}`);
     } catch (error) {
       logError('ORCHESTRATOR', `Reinvestment failed: ${(error as Error).message}`);
+      throw error;
     }
   }
 
@@ -250,9 +411,16 @@ class Orchestrator {
     });
     redisClient.on('message', async (channel, message) => {
       if (channel !== 'signals:new') return;
-      const trade = JSON.parse(message);
-      const validatedTrade = await this.validateTrade(trade);
-      if (validatedTrade) await this.tradeExecutionBreaker.fire(validatedTrade);
+      const signal: Signal = JSON.parse(message);
+      if ((signal.entryType === 'fibonacci' || signal.entryType === 'sentiment') && signal.action === 'buy' && this.isValidSentimentSignal(signal)) {
+        const token = JSON.parse((await redisClient.get(`tokens:${signal.ticker}`)) || '{}');
+        const trade = this.createTradeFromSignal(signal, token);
+        const validatedTrade = await this.validateTrade(trade);
+        if (validatedTrade) {
+          await this.coordinateAgents(signal);
+          await this.tradeExecutionBreaker.fire(validatedTrade);
+        }
+      }
     });
   }
 }
