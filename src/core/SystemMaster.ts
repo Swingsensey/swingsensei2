@@ -1,405 +1,166 @@
-import logger from '../utils/logger';
-import { Counter, Histogram, Gauge, register } from 'prom-client';
-import fs from 'fs/promises';
-import axios from 'axios';
-import { Request, Response, NextFunction } from 'express';
+import { Counter } from 'prom-client';
 import Redis from 'ioredis';
-import jwt from 'jsonwebtoken';
-import { MongoClient } from 'mongodb';
-import * as tf from '@tensorflow/tfjs';
-import { publish, subscribe } from '../utils/messageBroker';
-import { pipeline, Pipeline } from '@xenova/transformers';
+import { logInfo, logError, sendTelegramNotification } from './systemGuard';
+import { TariffChecker } from './TariffChecker';
 
-// Инициализация сервисов
-const redisClient = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
-const mongoClient = new MongoClient(process.env.MONGO_URI || 'mongodb://localhost:27017/swingsensei');
-
-// Prometheus метрики
-const apiLatency = new Histogram({
-  name: 'api_latency_seconds',
-  help: 'API response time in seconds',
-  labelNames: ['endpoint'],
-});
-const tradeSuccess = new Counter({
-  name: 'trades_success_total',
-  help: 'Total successful trades',
-  labelNames: ['ticker'],
-});
-const tradeFailure = new Counter({
-  name: 'trades_failure_total',
-  help: 'Total failed trades',
-  labelNames: ['ticker'],
-});
-const partialExits = new Counter({
-  name: 'partial_exits_total',
-  help: 'Total partial exits',
-  labelNames: ['ticker'],
-});
-const tradesExecuted = new Counter({
-  name: 'trades_executed_total',
-  help: 'Total trades executed',
-  labelNames: ['ticker'],
-});
-const signalsGenerated = new Counter({
-  name: 'signals_generated_total',
-  help: 'Total signals generated',
-  labelNames: ['agent'],
-});
-// Новые метрики для ROI, win rate и balance
-const roiMetric = new Gauge({ name: 'roi_total', help: 'Total ROI across trades' });
-const winRateMetric = new Gauge({ name: 'win_rate', help: 'Trade win rate percentage' });
-const balanceMetric = new Gauge({ name: 'balance', help: 'Total wallet balance' });
-
-// Регистрация новых метрик
-register.registerMetric(roiMetric);
-register.registerMetric(winRateMetric);
-register.registerMetric(balanceMetric);
-
-// Buffering log entries
-class LogBuffer {
-  private entries: string[] = [];
-  private readonly maxSize = 1000;
-  private readonly logFilePath = 'logs/buffer.txt';
-
-  async append(entry: string): Promise<void> {
-    this.entries.push(entry);
-    if (this.entries.length >= this.maxSize) {
-      await this.flush();
-    }
-    logger.info({ component: 'LOG_BUFFER', message: `Appended: ${entry}` });
-  }
-
-  async flush(): Promise<void> {
-    if (this.entries.length === 0) return;
-    await fs.appendFile(this.logFilePath, this.entries.join('\n') + '\n');
-    this.entries = [];
-    logger.info({ component: 'LOG_BUFFER', message: 'Buffer flushed' });
-  }
+interface SystemMasterConfig {
+  redisClient: Redis;
 }
 
-const logBuffer = new LogBuffer();
-
-// Логирование
-function logInfo(component: string, message: string): void {
-  logger.info({ component, message });
-  logBuffer.append(`${component}: ${message}`);
+interface ErrorData {
+  type: string;
+  provider: string;
+  task: string;
+  stack: string;
 }
 
-function logError(component: string, message: string): void {
-  logger.error({ component, message });
-  logBuffer.append(`ERROR ${component}: ${message}`);
-}
-
-// Ротация логов
-async function rotateLogFiles(): Promise<void> {
-  const files = await fs.readdir('logs');
-  const currentDate = new Date().toISOString().split('T')[0];
-  const oldFiles = files.filter(file => file.includes('api-') && !file.includes(currentDate));
-  for (const file of oldFiles) {
-    await fs.unlink(`logs/${file}`).catch(err => logError('LOG_ROTATION', `Failed to delete ${file}: ${err.message}`));
-  }
-  logInfo('LOG_ROTATION', 'Log files rotated');
-}
-
-// Аутентификация
-async function authenticateJwtToken(req: Request, res: Response, next: NextFunction): Promise<void> {
-  const token = req.headers['authorization']?.split(' ')[1];
-  if (!token) {
-    res.status(401).json({ error: 'Token missing' });
-    return;
-  }
-  const isBlacklisted = await redisClient.get(`blacklist:${token}`);
-  if (isBlacklisted) {
-    res.status(403).json({ error: 'Token blacklisted' });
-    return;
-  }
-  jwt.verify(token, process.env.JWT_SECRET!, (err: any, user: any) => {
-    if (err) {
-      res.status(403).json({ error: 'Invalid token' });
-      return;
-    }
-    req.user = user;
-    next();
-  });
-}
-
-// Метрики
-function recordPrometheusMetric(
-  metric: Histogram<string> | Counter<string> | Gauge<string>,
-  labels: Record<string, string | number>,
-  value?: number
-): void {
-  if ('observe' in metric && value !== undefined) {
-    metric.observe(labels, value);
-  } else if ('inc' in metric) {
-    metric.inc(labels);
-  } else if ('set' in metric && value !== undefined) {
-    metric.set(labels, value);
-  }
-}
-
-async function getPrometheusMetrics(): Promise<string> {
-  return register.metrics();
-}
-
-// Уведомления
-async function sendTelegramNotification(message: string): Promise<void> {
-  await axios.post(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    chat_id: process.env.TELEGRAM_CHAT_ID,
-    text: message,
-  });
-  logInfo('TELEGRAM', `Notification sent: ${message}`);
-}
-
-// MongoDB
-async function connectMongoDb(): Promise<any> {
-  await mongoClient.connect();
-  logInfo('MONGODB', 'Connected to MongoDB');
-  return mongoClient.db();
-}
-
-// Проверка целостности
-async function verifyProjectIntegrity(): Promise<boolean> {
-  const mongoDb = await connectMongoDb();
-  const collections = await mongoDb.listCollections().toArray();
-  const requiredCollections = ['tokens', 'trades', 'wallets', 'capital'];
-  const missingCollections = requiredCollections.filter(
-    name => !collections.some((c: any) => c.name === name)
-  );
-  if (missingCollections.length > 0) {
-    logError('INTEGRITY', `Missing collections: ${missingCollections.join(', ')}`);
-    return false;
-  }
-  logInfo('INTEGRITY', 'Project integrity verified');
-  return true;
-}
-
-// Резервное копирование
-async function backupMongoCollections(): Promise<void> {
-  const mongoDb = await connectMongoDb();
-  const collections = await mongoDb.listCollections().toArray();
-  for (const { name } of collections) {
-    const data = await mongoDb.collection(name).find().toArray();
-    const backupPath = `backups/${name}-${new Date().toISOString()}.json`;
-    await fs.writeFile(backupPath, JSON.stringify(data));
-  }
-  logInfo('BACKUP', 'MongoDB collections backed up');
-}
-
-// Мониторинг очередей
-async function monitorRedisQueues(): Promise<void> {
-  const queueKeys = await redisClient.keys('queue:*');
-  for (const queue of queueKeys) {
-    const length = await redisClient.llen(queue);
-    recordPrometheusMetric(new Histogram({
-      name: 'queue_length',
-      help: 'Length of Redis queues',
-      labelNames: ['queue'],
-    }), { queue }, length);
-  }
-  logInfo('QUEUES', `Monitored ${queueKeys.length} queues`);
-}
-
-// Класс SystemMaster
 class SystemMaster {
-  private readonly dqnModel: tf.Sequential;
-  private readonly mongoDb: any;
-  private readonly errorAnalyzer: Pipeline;
+  private readonly redis: Redis;
+  private readonly tariffChecker: TariffChecker;
+  private readonly sentimentRequestsTotal: Counter<string>;
+  private readonly freeApiRequestsTotal: Counter<string>;
+  private readonly aiApiCostTotal: Counter<string>;
+  private readonly taskCosts: Record<string, number> = {
+    trade_sensei: 0.0002,
+    data_hawk: 0.0001,
+    swarm_master: 0.0003,
+  };
 
-  constructor() {
-    this.dqnModel = this.initializeDqnModel();
-    this.mongoDb = connectMongoDb();
-    this.errorAnalyzer = this.initializeErrorAnalyzer();
-    this.subscribeToRedisEvents();
+  constructor({ redisClient }: SystemMasterConfig) {
+    this.redis = redisClient;
+    this.tariffChecker = new TariffChecker(redisClient);
+    this.initializeMetrics();
+    setInterval(() => this.monitorApiLimits(), 60 * 60 * 1000);
   }
 
-  private initializeDqnModel(): tf.Sequential {
-    const model = tf.sequential();
-    model.add(tf.layers.dense({ units: 64, inputShape: [5], activation: 'relu' }));
-    model.add(tf.layers.dense({ units: 32, activation: 'relu' }));
-    model.add(tf.layers.dense({ units: 3, activation: 'linear' }));
-    model.compile({ optimizer: 'adam', loss: 'meanSquaredError' });
-    return model;
-  }
-
-  private async initializeErrorAnalyzer(): Promise<Pipeline> {
-    return pipeline('text-generation', 'distilbert-base-uncased');
-  }
-
-  private async subscribeToRedisEvents(): Promise<void> {
-    await subscribe('system:events', async (message: string) => {
-      const event = JSON.parse(message);
-      switch (event.type) {
-        case 'errors:detected':
-          await this.analyzeError(event.payload);
-          break;
-        case 'trades:executed':
-          await this.updateTradeMetrics(event.payload);
-          break;
-      }
+  private initializeMetrics(): void {
+    this.sentimentRequestsTotal = new Counter({
+      name: 'sentiment_requests_total',
+      help: 'Total number of sentiment analysis requests',
+      labelNames: ['provider'],
     });
-    logInfo('SYSTEMMASTER', 'Subscribed to Redis events');
+
+    this.freeApiRequestsTotal = new Counter({
+      name: 'free_api_requests_total',
+      help: 'Total number of free AI API requests',
+      labelNames: ['provider', 'task'],
+    });
+
+    this.aiApiCostTotal = new Counter({
+      name: 'ai_api_cost_total',
+      help: 'Total cost of AI API requests in USD',
+      labelNames: ['provider'],
+    });
   }
 
-  private async analyzeError(error: any): Promise<void> {
+  async reportError(error: ErrorData): Promise<void> {
     try {
-      const analysis = await this.errorAnalyzer(`Analyze error: ${JSON.stringify(error)}`, {
-        max_length: 100,
+      const errorId = `error:${error.provider}:${error.task}:${Date.now()}`;
+      await this.redis.set(errorId, JSON.stringify(error), 'EX', 86400);
+      await this.redis.publish('errors:detected', JSON.stringify({ errorId, ...error }));
+      logInfo('SYSTEMMASTER', `Published error: ${errorId}`);
+    } catch (err) {
+      logError('SYSTEMMASTER', `Failed to report error: ${(err as Error).message}`);
+    }
+  }
+
+  private async monitorApiLimits(): Promise<void> {
+    try {
+      const report = await this.generateUsageReport();
+      await sendTelegramNotification(report);
+      logInfo('SYSTEMMASTER', report);
+    } catch (error) {
+      await this.reportError({
+        type: 'monitor_error',
+        provider: 'system',
+        task: 'monitor_api_limits',
+        stack: (error as Error).message,
       });
-      const result = analysis[0].generated_text;
-      await publish('errors:resolved', JSON.stringify({ error, analysis: result }));
-      await sendTelegramNotification(`Error resolved: ${error.message}\nAnalysis: ${result}`);
-      logInfo('SYSTEMMASTER', `Error analyzed: ${error.message}`);
-    } catch (err) {
-      logError('SYSTEMMASTER', `Error analysis failed: ${err.message}`);
-      await this.fallbackErrorAnalysis(error);
     }
   }
 
-  private async fallbackErrorAnalysis(error: any): Promise<void> {
-    try {
-      const response = await axios.post(
-        'https://api.deepseek.com/v1',
-        { prompt: `Analyze error: ${JSON.stringify(error)}` },
-        { headers: { Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` } }
-      );
-      const analysis = response.data.text;
-      await publish('errors:resolved', JSON.stringify({ error, analysis }));
-      await sendTelegramNotification(`Error resolved (DeepSeek): ${error.message}\nAnalysis: ${analysis}`);
-      logInfo('SYSTEMMASTER', `Error analyzed via DeepSeek: ${error.message}`);
-    } catch (err) {
-      logError('SYSTEMMASTER', `DeepSeek analysis failed: ${err.message}`);
-    }
-  }
+  private async generateUsageReport(): Promise<string> {
+    const providers = ['deepseek', 'gemini', 'yandexgpt', 'openai', 'huggingface', 'free'];
+    const freeProviders = ['gpt4free', 'ionet'];
+    const quotas: Record<string, number> = {
+      deepseek: parseInt(process.env.DEEPSEEK_FREE_QUOTA || '1000'),
+      gemini: parseInt(process.env.GEMINI_FREE_QUOTA || '100'),
+      yandexgpt: parseInt(process.env.YANDEXGPT_FREE_QUOTA || '500'),
+      openai: parseInt(process.env.OPENAI_FREE_QUOTA || '1000'),
+      huggingface: parseInt(process.env.HUGGINGFACE_FREE_QUOTA || '1000'),
+    };
 
-  private async updateTradeMetrics(trade: any): Promise<void> {
-    try {
-      const mongoDb = await this.mongoDb;
-      tradesExecuted.inc({ ticker: trade.ticker });
-      if (trade.success) {
-        tradeSuccess.inc({ ticker: trade.ticker });
-      } else {
-        tradeFailure.inc({ ticker: trade.ticker });
+    let report = '📊 AI API Usage Report:\n';
+    const paidRequests: Record<string, number> = {};
+    const paidCosts: Record<string, number> = {};
+    const freeRequests: Record<string, Record<string, number>> = {};
+    const freeErrors: Record<string, Record<string, number>> = {};
+    const freeBlocks: Record<string, number> = {};
+
+    // Paid APIs
+    for (const provider of providers) {
+      const requests = (await this.sentimentRequestsTotal.get())?.values.find(v => v.labels.provider === provider)?.value || 0;
+      const cost = (await this.aiApiCostTotal.get())?.values.find(v => v.labels.provider === provider)?.value || 0;
+      if (provider !== 'free') {
+        paidRequests[provider] = requests;
+        paidCosts[provider] = cost;
+        const quota = quotas[provider] || 1000;
+        const usagePercent = (requests / quota) * 100;
+        report += `- ${provider}: ${requests}/${quota} requests (${usagePercent.toFixed(1)}%), cost: $${cost.toFixed(4)}\n`;
+        if (usagePercent > 80) {
+          report += `  ⚠️ High usage! Consider upgrading plan.\n`;
+          await this.reportError({
+            type: 'cloud_limit_warning',
+            provider,
+            task: 'api_usage',
+            stack: `Usage at ${usagePercent.toFixed(1)}% for ${provider}`,
+          });
+        }
       }
-      if (trade.partialExit) {
-        partialExits.inc({ ticker: trade.ticker });
+    }
+
+    // Free APIs
+    report += '\n📊 Free AI API Usage:\n';
+    for (const provider of freeProviders) {
+      const tasks = ['trade_sensei', 'data_hawk', 'swarm_master'];
+      freeRequests[provider] = {};
+      freeErrors[provider] = {};
+      let totalRequests = 0;
+      let totalSavings = 0;
+
+      for (const task of tasks) {
+        const reqs = (await this.freeApiRequestsTotal.get())?.values.find(v => v.labels.provider === provider && v.labels.task === task)?.value || 0;
+        const errors = parseInt(await this.redis.get(`error:${provider}:${task}`) || '0');
+        freeRequests[provider][task] = reqs;
+        freeErrors[provider][task] = errors;
+        totalRequests += reqs;
+        totalSavings += reqs * this.taskCosts[task];
       }
 
-      const trades = await mongoDb.collection('trades').find().toArray();
-      const wallets = await mongoDb.collection('wallets').find().toArray();
-
-      const roi = this.calculateRoi(trades);
-      const winRate = this.calculateWinRate(trades);
-      const balance = this.calculateBalance(wallets);
-      const walletCount = wallets.length;
-
-      recordPrometheusMetric(roiMetric, {}, roi);
-      recordPrometheusMetric(winRateMetric, {}, winRate);
-      recordPrometheusMetric(balanceMetric, {}, balance);
-      recordPrometheusMetric(new Counter({
-        name: 'wallets_count',
-        help: 'Number of wallets',
-        labelNames: ['component'],
-      }), { component: 'system' }, walletCount);
-
-      logInfo('SYSTEMMASTER', 'Trade metrics updated');
-    } catch (err) {
-      logError('SYSTEMMASTER', `Failed to update metrics: ${err.message}`);
+      freeBlocks[provider] = provider === 'gpt4free' ? parseInt(await this.redis.get(`gpt4free:block:${provider}`) || '0') : 0;
+      report += `- ${provider}: ${totalRequests} requests, ${Object.values(freeErrors[provider]).reduce((a, b) => a + b, 0)} errors, savings: $${totalSavings.toFixed(4)}\n`;
+      if (freeBlocks[provider] > 0) {
+        report += `  ⚠️ ${freeBlocks[provider]} blocks detected\n`;
+        await this.reportError({
+          type: 'api_block',
+          provider,
+          task: 'free_api',
+          stack: `${freeBlocks[provider]} blocks detected for ${provider}`,
+        });
+      }
     }
-  }
 
-  private calculateRoi(trades: any[]): number {
-    return trades.length > 0
-      ? trades.reduce((sum: number, trade: any) => sum + trade.roi, 0) / trades.length
-      : 0;
-  }
-
-  private calculateWinRate(trades: any[]): number {
-    const wins = trades.filter((trade: any) => trade.success).length;
-    return trades.length > 0 ? (wins / trades.length) * 100 : 0;
-  }
-
-  private calculateBalance(wallets: any[]): number {
-    return wallets.reduce((sum: number, wallet: any) => sum + wallet.balance, 0);
-  }
-
-  async trainDqnModel(): Promise<void> {
-    try {
-      const mongoDb = await this.mongoDb;
-      const trades = await mongoDb.collection('trades').find().toArray();
-      const { states, actions } = this.prepareDqnData(trades);
-
-      const inputs = tf.tensor2d(states);
-      const targets = tf.tensor2d(actions);
-      await this.dqnModel.fit(inputs, targets, { epochs: 10 });
-      inputs.dispose();
-      targets.dispose();
-
-      await this.dqnModel.save('file://./models/dqn');
-      await publish('models:updated', JSON.stringify({ model: 'dqn', timestamp: new Date().toISOString() }));
-      logInfo('SYSTEMMASTER', 'DQN model trained and saved');
-    } catch (err) {
-      logError('SYSTEMMASTER', `DQN training failed: ${err.message}`);
+    // Recommendations
+    const recommendations = await this.tariffChecker.analyzeTaskRedistribution();
+    if (recommendations.length > 0) {
+      report += '\n🔄 Task Redistribution Recommendations:\n';
+      for (const rec of recommendations) {
+        report += `- Move "${rec.task}" to ${rec.toProvider}: saves $${rec.savings.toFixed(4)}, performance ${rec.performanceChange > 0 ? '+' : ''}${rec.performanceChange.toFixed(2)}\n`;
+      }
     }
-  }
 
-  private prepareDqnData(trades: any[]): { states: number[][], actions: number[][] } {
-    const states = trades.map((trade: any) => {
-      const normalizedPrice = trade.price / 1000;
-      const normalizedVolume = trade.volume / 1000000;
-      return [normalizedPrice, normalizedVolume, trade.roi, trade.positionSize, trade.executionTime];
-    });
-    const actions = trades.map((trade: any) =>
-      trade.action === 'buy' ? [1, 0, 0] : trade.action === 'sell' ? [0, 1, 0] : [0, 0, 1]
-    );
-    return { states, actions };
-  }
-
-  async trainLlmModel(): Promise<void> {
-    try {
-      const mongoDb = await this.mongoDb;
-      const trades = await mongoDb.collection('trades').find().toArray();
-      const trainingData = trades.map((trade: any) => ({
-        text: `Trade: ${trade.ticker}, Price: ${trade.price}, Volume: ${trade.volume}`,
-        label: trade.explanation || 'No explanation provided',
-      }));
-
-      const trainer = await pipeline('text-classification', 'distilbert-base-uncased');
-      logInfo('SYSTEMMASTER', 'Simulated LLM training with DistilBERT');
-
-      await publish('models:updated', JSON.stringify({ model: 'llm', timestamp: new Date().toISOString() }));
-      logInfo('SYSTEMMASTER', 'LLM model training completed');
-    } catch (err) {
-      logError('SYSTEMMASTER', `LLM training failed: ${err.message}`);
-    }
-  }
-
-  async startMonitoring(): Promise<void> {
-    setInterval(() => rotateLogFiles(), 24 * 60 * 60 * 1000);
-    setInterval(() => monitorRedisQueues(), 60 * 1000);
-    setInterval(() => this.trainDqnModel(), 24 * 60 * 60 * 1000);
-    setInterval(() => this.trainLlmModel(), 7 * 24 * 60 * 60 * 1000);
-    logInfo('SYSTEMMASTER', 'Monitoring started');
+    return report;
   }
 }
 
-export {
-  LogBuffer,
-  logInfo,
-  logError,
-  rotateLogFiles,
-  authenticateJwtToken,
-  recordPrometheusMetric,
-  getPrometheusMetrics,
-  sendTelegramNotification,
-  verifyProjectIntegrity,
-  backupMongoCollections,
-  monitorRedisQueues,
-  SystemMaster,
-  apiLatency,
-  tradeSuccess,
-  tradeFailure,
-  partialExits,
-  tradesExecuted,
-  signalsGenerated,
-};
+export { SystemMaster, SystemMasterConfig, ErrorData };
