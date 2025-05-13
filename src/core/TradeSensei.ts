@@ -9,40 +9,12 @@ import axios from 'axios';
 import { load } from 'ts-dotenv';
 import { logger } from '../utils/logger';
 import { metrics } from '../utils/metrics';
-import { ATR } from 'technicalindicators';
-import CircuitBreaker from 'opossum';
-
-// Конфигурация сигнала
-interface SignalConfig {
-  ticker: string;
-  price: number;
-  high: number;
-  low: number;
-  volume: number;
-  marketCap: number;
-  liquidity: number;
-  holders: number;
-  transactions: number;
-  sentimentScore?: number;
-  fearGreedIndex?: number;
-}
-
-// Зависимости TradeSensei
-interface TradeSenseiDependencies {
-  redis: Redis;
-  mongo: MongoClient;
-  jupiter: Jupiter;
-  solscanApiKey: string;
-  cieloApiKey: string;
-  telegramBotToken: string;
-  telegramChatId: string;
-}
+import { Token, Signal, TradeSenseiDependencies } from '../types';
 
 // Класс TradeSensei
 class TradeSensei {
   private dqnModel: tf.Sequential | null = null;
   private balance = 1000; // Начальный баланс для paper trading
-  private readonly atrPeriod = 14; // Период для ATR
   private readonly filterGuard = new FilterGuard();
   private readonly solscanBreaker = new CircuitBreaker(
     (ticker: string) =>
@@ -65,25 +37,42 @@ class TradeSensei {
   constructor(private readonly deps: TradeSenseiDependencies) {}
 
   // Валидация токена
-  private validateToken(token: any): SignalConfig | null {
+  private validateToken(token: any): { token: Token; signal: Partial<Signal> } | null {
     const requiredFields = ['ticker', 'price', 'high', 'low', 'volume', 'marketCap', 'holders', 'transactions'];
     if (!token || requiredFields.some((field) => !token[field] || token[field] < 0)) {
       logger.warn('Некорректные данные токена');
       return null;
     }
-    return {
+    const validatedToken: Token = {
       ticker: token.ticker,
       price: token.price,
-      high: token.high,
-      low: token.low,
       volume: token.volume,
+      marketCap: token.marketCap,
+      liquidity: token.liquidity || 0,
+      priceChange: token.priceChange || 0,
+    };
+    const signal: Partial<Signal> = {
+      ticker: token.ticker,
       marketCap: token.marketCap,
       liquidity: token.liquidity || 0,
       holders: token.holders,
       transactions: token.transactions,
       sentimentScore: token.sentimentScore || 0.5,
       fearGreedIndex: token.fearGreedIndex || 50,
+      snipers: token.snipers || 0,
+      devHoldings: token.devHoldings || 0,
+      socialVolume: token.socialVolume || 0,
+      socialScore: token.socialScore || 0,
+      galaxyScore: token.galaxyScore || 0,
+      announcementImpact: token.announcementImpact || 0,
+      category: token.category || 'trend',
+      channel: token.channel || 'unknown',
     };
+    if (token.source === 'news') {
+      if (signal.marketCap! > 500_000 || signal.snipers! > 0.5 || signal.devHoldings! > 0.05) return null;
+      if (!['call', 'trend'].includes(signal.category!)) return null;
+    }
+    return { token: validatedToken, signal };
   }
 
   // Получение ликвидности через Dexscreener API
@@ -180,10 +169,12 @@ class TradeSensei {
 
     const diff = high - low;
     const fibLevels = {
-      '23.6%': low + diff * 0.236,
-      '38.2%': low + diff * 0.382,
-      '50%': low + diff * 0.5,
-      '61.8%': low + diff * 0.618,
+      level_236: low + diff * 0.236,
+      level_382: low + diff * 0.382,
+      level_500: low + diff * 0.5,
+      level_618: low + diff * 0.618,
+      lastMin: low,
+      lastMax: high,
     };
 
     await this.deps.redis.setex(cacheKey, 300, JSON.stringify(fibLevels));
@@ -191,21 +182,68 @@ class TradeSensei {
   }
 
   // Проверка входа по Фибоначчи
-  private calculateFibonacciEntry(price: number, fibLevels: any): boolean {
-    return price <= fibLevels['38.2%'] || price <= fibLevels['50%'] || price <= fibLevels['61.8%'];
+  private async calculateFibonacciEntry(token: Token, signal: Partial<Signal>, fibLevels: any): Promise<{ isValid: boolean; fibonacciLevel: number } | null> {
+    const price = token.price;
+    const tolerance = 0.02; // ±2%
+    const targetLevels = [fibLevels.level_382, fibLevels.level_618];
+
+    // Проверка близости цены к уровням 38.2% или 61.8%
+    const closestLevel = targetLevels.find(
+      (level) => price >= level * (1 - tolerance) && price <= level * (1 + tolerance)
+    );
+    if (!closestLevel) return null;
+
+    // Проверка роста объема (за последние 15 мин)
+    const historicalData = await this.deps.mongo
+      .db('swingsensei')
+      .collection('tokens_history')
+      .findOne({ ticker: token.ticker, timestamp: { $gte: new Date(Date.now() - 15 * 60 * 1000) } });
+    if (!historicalData || token.volume <= historicalData.volume * 1.5) {
+      logger.warn(`Недостаточный рост объема для ${token.ticker}`);
+      return null;
+    }
+
+    // Проверка активности китов
+    const whaleActivity = await this.fetchWhaleActivity(token.ticker);
+    if (!whaleActivity) {
+      logger.warn(`Китовые транзакции не подтверждены для ${token.ticker}`);
+      return null;
+    }
+
+    // Проверка sentimentScore
+    if (signal.sentimentScore! <= 0.7) {
+      logger.warn(`Недостаточный sentimentScore для ${token.ticker}`);
+      return null;
+    }
+
+    return { isValid: true, fibonacciLevel: closestLevel };
+  }
+
+  // Проверка истории импульсов для DQN
+  private async checkImpulseHistory(ticker: string): Promise<number> {
+    const trades = await this.deps.mongo
+      .db('swingsensei')
+      .collection('trades')
+      .find({ ticker, timestamp: { $gte: new Date(Date.now() - 15 * 60 * 1000) } })
+      .toArray();
+    return trades.some((trade) => trade.entryType === 'fibonacci' && [0.382, 0.618].includes(trade.fibonacciLevel)) ? 1 : 0;
   }
 
   // Формирование состояния для DQN
-  private buildSignalState(config: SignalConfig): number[] {
+  private async buildSignalState(token: Token, signal: Partial<Signal>, fibLevels: any): Promise<number[]> {
+    const impulseHistory = await this.checkImpulseHistory(token.ticker);
     return [
-      config.price,
-      config.volume,
-      config.marketCap,
-      config.liquidity,
-      config.holders,
-      config.transactions,
-      config.sentimentScore!,
-      config.fearGreedIndex! / 100,
+      token.price,
+      token.volume,
+      token.marketCap,
+      signal.liquidity!,
+      signal.holders!,
+      signal.transactions!,
+      signal.sentimentScore!,
+      signal.fearGreedIndex! / 100,
+      fibLevels.level_382,
+      fibLevels.level_618,
+      impulseHistory,
     ];
   }
 
@@ -225,148 +263,75 @@ class TradeSensei {
       return null;
     }
 
-    const config = this.validateToken(token);
-    if (!config) return null;
+    const validated = this.validateToken(token);
+    if (!validated) return null;
+    const { token: validatedToken, signal: validatedSignal } = validated;
 
-    const liquidity = await this.fetchPoolLiquidity(config.ticker);
+    const liquidity = await this.fetchPoolLiquidity(validatedToken.ticker);
     if (!liquidity) return null;
-    config.liquidity = liquidity;
+    validatedToken.liquidity = liquidity;
+    validatedSignal.liquidity = liquidity;
 
     const filters = [
-      { name: 'Trending5min', passed: this.filterGuard.applyTrending5min(config) },
-      { name: 'NextBC5min', passed: this.filterGuard.applyNextBC5min(config) },
-      { name: 'SolanaSwingSniper', passed: this.filterGuard.applySolanaSwingSniper(config) },
+      { name: 'Trending5min', passed: this.filterGuard.applyTrending5min(validatedToken) },
+      { name: 'NextBC5min', passed: this.filterGuard.applyNextBC5min(validatedToken) },
+      { name: 'SolanaSwingSniper', passed: this.filterGuard.applySolanaSwingSniper(validatedToken) },
     ];
 
     const filterPassed = filters.find((f) => f.passed && this.validateLiquidity(liquidity, f.name));
     if (!filterPassed) {
-      logger.warn(`Фильтры не пройдены для ${config.ticker}`);
+      logger.warn(`Фильтры не пройдены для ${validatedToken.ticker}`);
       return null;
     }
 
-    const whaleActivity = await this.fetchWhaleActivity(config.ticker);
-    if (!whaleActivity) {
-      logger.warn(`Китовые транзакции не подтверждены для ${config.ticker}`);
+    const fibLevels = await this.calculateFibonacciLevels(token.high || token.price, token.low || token.price, validatedToken.ticker);
+    const fibEntry = await this.calculateFibonacciEntry(validatedToken, validatedSignal, fibLevels);
+    if (!fibEntry) {
+      logger.warn(`Фибоначчи вход не подтвержден для ${validatedToken.ticker}`);
       return null;
     }
 
     const calculatedTradeVolume = Math.min(liquidity * 0.008, liquidity * 0.001, this.balance * 0.1);
     if (calculatedTradeVolume <= 0) {
-      logger.warn(`Недостаточный объем для ${config.ticker}`);
+      logger.warn(`Недостаточный объем для ${validatedToken.ticker}`);
       return null;
     }
 
-    const fibLevels = await this.calculateFibonacciLevels(config.high, config.low, config.ticker);
-    if (!this.calculateFibonacciEntry(config.price, fibLevels)) {
-      logger.warn(`Фибоначчи вход не подтвержден для ${config.ticker}`);
-      return null;
-    }
-
-    const state = this.buildSignalState(config);
+    const state = await this.buildSignalState(validatedToken, validatedSignal, fibLevels);
     const action = this.applyDQNModel(state);
 
-    if (action === 1 && config.sentimentScore! > 0.7) {
-      const signal = {
+    if (action === 1) {
+      const signal: Signal = {
         agent: 'TradeSensei',
-        signal: 'buy',
-        confidence: Math.min(0.8 + config.sentimentScore! * 0.1, 0.95),
-        timestamp: Date.now(),
-        token: config,
-        volume: calculatedTradeVolume,
+        action: 'buy',
+        entryType: 'fibonacci',
+        fibonacciLevel: fibEntry.fibonacciLevel,
+        timestamp: Date.now().toString(),
         source,
+        confidence: 0.8, // Можно уточнить логику
+        ticker: validatedToken.ticker,
+        volume: calculatedTradeVolume,
+        marketCap: validatedToken.marketCap,
+        liquidity: validatedSignal.liquidity,
+        snipers: validatedSignal.snipers!,
+        devHoldings: validatedSignal.devHoldings!,
+        socialVolume: validatedSignal.socialVolume!,
+        socialScore: validatedSignal.socialScore!,
+        galaxyScore: validatedSignal.galaxyScore!,
+        announcementImpact: validatedSignal.announcementImpact!,
+        category: validatedSignal.category!,
+        channel: validatedSignal.channel!,
+        sentimentScore: validatedSignal.sentimentScore,
+        fearGreedIndex: validatedSignal.fearGreedIndex,
       };
 
       await this.deps.redis.publish('signals:new', JSON.stringify(signal));
       await this.deps.mongo.db('swingsensei').collection('signals').insertOne(signal);
-      metrics.inc('signals_generated');
+      metrics.signalsGenerated.inc({ source });
       return signal;
     }
 
     return null;
-  }
-
-  // Расчет ATR
-  private async calculateATR(ticker: string): Promise<number> {
-    const cacheKey = `trades:atr:${ticker}`;
-    const cached = await this.deps.redis.get(cacheKey);
-    if (cached) {
-      return parseFloat(cached);
-    }
-
-    const historicalPrices = await this.deps.mongo
-      .db('swingsensei')
-      .collection('trades')
-      .find({ ticker })
-      .sort({ timestamp: -1 })
-      .limit(this.atrPeriod)
-      .toArray();
-
-    const atrValues = ATR.calculate({
-      high: historicalPrices.map((t) => t.high || t.price),
-      low: historicalPrices.map((t) => t.low || t.price),
-      close: historicalPrices.map((t) => t.price),
-      period: this.atrPeriod,
-    });
-
-    const atr = atrValues[atrValues.length - 1] || 0;
-    await this.deps.redis.setex(cacheKey, 300, atr.toString());
-    return atr;
-  }
-
-  // Расчет трейлинг-стопа
-  private calculateTrailingStop(entryPrice: number, roi: number, atr: number): number {
-    return entryPrice * (1 + roi - atr * 2);
-  }
-
-  // Выполнение частичного выхода
-  async executePartialExit(trade: any) {
-    const { ticker, price, entryPrice, volume } = trade;
-    if (!ticker || !price || !entryPrice || !volume) {
-      logger.warn('Некорректные данные сделки');
-      return;
-    }
-
-    const roi = (price - entryPrice) / entryPrice;
-    const atr = await this.calculateATR(ticker);
-    const trailingStop = this.calculateTrailingStop(entryPrice, roi, atr);
-
-    let exitPercentage = 0;
-    if (roi >= 1) exitPercentage = 0.3; // 30% при +100%
-    else if (roi >= 0.5) exitPercentage = 0.3; // 30% при +50%
-    else if (price <= trailingStop || roi <= -0.15) exitPercentage = 1; // Трейлинг-стоп или -15%
-
-    if (exitPercentage > 0) {
-      const exitTrade = { ticker, percentage: exitPercentage, price, timestamp: Date.now() };
-      await this.deps.redis.publish('trade:partial_exit', JSON.stringify(exitTrade));
-      await this.deps.mongo.db('swingsensei').collection('partial_exits').insertOne(exitTrade);
-      metrics.inc('partial_exits');
-
-      const profit = (price - entryPrice) * exitPercentage * volume;
-      if (this.balance < 2000) {
-        this.balance += profit;
-      } else if (this.balance < 5000) {
-        this.balance += profit * 0.75;
-        await this.deps.mongo.db('swingsensei').collection('wallets').updateOne(
-          { type: 'bank' },
-          { $inc: { balance: profit * 0.25 } },
-          { upsert: true }
-        );
-      } else {
-        this.balance += profit * 0.6;
-        await this.deps.mongo.db('swingsensei').collection('wallets').updateOne(
-          { type: 'bank' },
-          { $inc: { balance: profit * 0.4 } },
-          { upsert: true }
-        );
-        if ((await this.deps.mongo.db('swingsensei').collection('wallets').countDocuments()) < 3) {
-          await WebhookAgent.notifyTelegram(
-            'Требуется новый кошелек: баланс > $5,000',
-            this.deps.telegramBotToken,
-            this.deps.telegramChatId
-          );
-        }
-      }
-    }
   }
 
   // Арбитраж сигнала
@@ -406,8 +371,8 @@ class TradeSensei {
         .filter((v) => v !== null);
 
       const decision = votes.reduce((acc, vote) => (vote === 'approve' ? acc + 1 : acc), 0) > votes.length / 2 ? 'approve' : 'reject';
-      await this.deps.redis.publish('arbitration:decisions', JSON.stringify({ signal, decision }));
-      metrics.inc('arbitration_decisions');
+      await this.deps.redis.publish('arbitration:decisions', JSON.stringify({ ticker: token.ticker, decision }));
+      metrics.arbitrationDecisions.inc();
       return decision;
     } catch (error) {
       logger.error('Ошибка арбитража:', error);
@@ -428,7 +393,7 @@ class TradeSensei {
       }
     } catch (error) {
       logger.error('Ошибка загрузки DQN:', error);
-      metrics.inc('errors_dqn_load');
+      metrics.errors_dqn_load.inc();
     }
   }
 
@@ -443,17 +408,26 @@ class TradeSensei {
         .limit(50)
         .toArray();
 
-      const states = trades.map((t) => [
-        t.price,
-        t.volume,
-        t.marketCap,
-        t.liquidity,
-        t.holders,
-        t.transactions,
-        t.sentimentScore || 0.5,
-        t.fearGreedIndex || 50,
-      ]);
-      const rewards = trades.map((t) => (t.roi * t.volume) / this.balance);
+      const states = await Promise.all(
+        trades.map(async (t) => {
+          const fibLevels = await this.calculateFibonacciLevels(t.high || t.price, t.low || t.price, t.ticker);
+          const impulseHistory = await this.checkImpulseHistory(t.ticker);
+          return [
+            t.price,
+            t.volume,
+            t.marketCap,
+            t.liquidity,
+            t.holders,
+            t.transactions,
+            t.sentimentScore || 0.5,
+            t.fearGreedIndex || 50,
+            fibLevels.level_382,
+            fibLevels.level_618,
+            impulseHistory,
+          ];
+        })
+      );
+      const rewards = trades.map((t) => (t.entryType === 'fibonacci' ? t.roi * t.volume * 1.2 : t.roi * t.volume) / this.balance);
       const actions = trades.map((t) => (t.action === 'buy' ? 1 : 0));
 
       const stateTensor = tf.tensor2d(states);
@@ -524,7 +498,7 @@ class TradeSensei {
         }
       } catch (error) {
         logger.error(`Ошибка обработки сообщения ${channel}:`, error);
-        metrics.inc('errors_message_processing');
+        metrics.errors_message_processing.inc();
       }
     });
   }
