@@ -15,6 +15,30 @@ export interface Token {
   };
 }
 
+export interface FilterParams {
+  name: string;
+  minVolume: number;
+  minLiquidity: number;
+  minHolders?: number;
+  minSocialPosts?: number;
+  minSentiment?: number;
+  minPriceChange?: number;
+  maxPriceChange?: number;
+  minMarketCap?: number;
+  maxMarketCap?: number;
+  minWhales?: number;
+  whaleMinTransfer?: number;
+  burnedLP?: number;
+  minTransactions?: number;
+  requireInfluencers?: boolean;
+  minAge?: number;
+  maxAge?: number;
+  minVolumeGrowth?: number;
+  minLiquidityGrowth?: number;
+  minHoldersGrowth?: number;
+  maxHolderConcentration?: number;
+}
+
 export interface Signal {
   ticker: string;
   action: 'buy' | 'sell' | 'hold';
@@ -44,8 +68,6 @@ export interface NewsSignal {
   ticker: string;
   sentimentScore: number;
   announcementImpact: number;
-  timestamp: string;
-  source: string;
   marketCap?: number;
   liquidity?: number;
   snipers?: number;
@@ -55,44 +77,58 @@ export interface NewsSignal {
   priceChange1h?: number;
   holders?: number;
   topHolders?: number;
+  category?: string;
+  channel?: string;
+  socialVolume?: number;
+  socialScore?: number;
+  galaxyScore?: number;
 }
 
 export interface NewsItem {
+  ticker: string;
   text: string;
   source: string;
   timestamp: string;
-  category: string;
-  channel?: string;
 }
 
 export interface LunarCrushData {
+  ticker: string;
   socialVolume: number;
   socialScore: number;
   galaxyScore: number;
+  socialPosts: number;
+  sentiment: number;
+  timestamp: string;
+}
+
+export interface XAlphaData {
+  ticker: string;
+  socialPosts: number;
+  sentiment: number;
+  influenceScore: number;
+  timestamp: string;
 }
 
 export interface BirdeyeData {
-  symbol: string;
-  price: number;
-  volume_5min: number;
+  volume: number;
   liquidity: number;
   marketCap: number;
+  priceChange: number;
+  price: number;
 }
 
 export interface SolscanData {
-  tokenAddress: string;
-  price: number;
-  volume: number;
-  marketCap: number;
+  holders: number;
+  burnedLP: number;
+  transactions: number;
+  createdAt: number;
 }
 
 export interface RaydiumPair {
-  symbol: string;
-  price: number;
-  volume_24h: number;
-  market_cap: number;
+  pairAddress: string;
+  baseToken: string;
+  quoteToken: string;
   liquidity: number;
-  price_change_24h: number;
 }
 
 export interface Trade {
@@ -101,75 +137,60 @@ export interface Trade {
   positionSize: number;
   price: number;
   walletId: string;
-  timestamp: string;
   roi: number;
   entryType: 'fibonacci' | 'sentiment' | 'volume';
-  fibonacciLevel?: number;
-  exitReason?: 'trailingStop' | 'fibonacciLevel';
-  filter?: number;
+  exitReason: 'trailingStop' | 'fibonacciLevel';
 }
 
 export interface Wallet {
-  walletId: string;
+  id: string;
   balance: number;
-  type: 'trading' | 'bank';
+  tokens: Record<string, number>;
 }
 
 export interface TradeSenseiDependencies {
-  redis: Redis;
-  mongo: MongoClient;
+  redis: any;
   jupiter: any;
-  solscanApiKey: string;
-  cieloApiKey: string;
-  telegramBotToken: string;
-  telegramChatId: string;
+  aiConsilium: any;
 }
 
-export type SwarmCommand = 'analyze_fibonacci' | 'scan_signal' | 'auto_trade' | 'rebalance';
+export interface SwarmCommand {
+  agent: string;
+  task: string;
+  priority: number;
+}
 
 export interface SwarmPayload {
-  ticker?: string;
-  entryPrice?: number;
-  strategy?: string;
-  walletId?: string;
-  size?: number;
+  command: SwarmCommand;
+  data: any;
 }
 
 export interface DQNState {
+  price: number;
   volume: number;
   liquidity: number;
-  priceChange: number;
-  socialSentiment: number;
-  whaleActivity: number;
-  volatility: number;
-  socialVolume: number;
-  galaxyScore: number;
-  announcementImpact: number;
+  sentiment: number;
 }
 
 export interface CoordinationResult {
-  asset: string;
-  action: 'buy' | 'sell' | 'hold';
-  confidence: number;
-  source: 'SwarmMaster';
+  success: boolean;
+  agent: string;
+  task: string;
 }
 
 export interface ErrorMessage {
-  errorId: string;
-  type: string;
-  provider: string;
-  task: string;
-  stack: string;
+  id: string;
+  message: string;
+  timestamp: string;
 }
 
 export interface ErrorResolution {
-  errorId: string;
-  solution: string;
-  resolved: boolean;
+  id: string;
+  resolution: string;
+  timestamp: string;
 }
 
 export interface DQNWeights {
-  newsWeight: number;
-  timestamp: Date;
-  weights: any[];
+  weights: number[];
+  biases: number[];
 }
