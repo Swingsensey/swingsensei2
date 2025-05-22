@@ -1,0 +1,328 @@
+# SwingSensei: Модульный контекст (contex2_modular.txt)
+
+## Обзор
+SwingSensei — торговый бот для мемкоинов на Solana, ориентированный на пользователей без опыта программирования. Цель: доходность >$100,000 за месяц с $1,000 (~20% дневной ROI в paper trading). Использует скрапинг (GMGN.ai, Raydium, Birdeye), социальные метрики (LunarCrush, XAlpha, Telegram, Twitter), ИИ-рой (7 агентов), фильтры (Trending 5min, NextBC 5min, Solana Swing Sniper, NewlyReached10M), paper trading через Jupiter API. Деплой на Render (Docker) с резервом на Vercel. Интерфейс: React/Tailwind CSS, real-time через WebSocket. Отказоустойчивость: Circuit Breaker, экспоненциальный backoff, ротация API/логов.
+
+## Модули
+
+### 1. DataHawk
+- **Описание**: Сбор данных о токенах и социальных метриках, расчет уровней Фибоначчи, анализ настроений через ИИ-консилиум.
+- **Входы**:
+  - Скрапинг: GMGN.ai, Raydium, Birdeye (Puppeteer, BrightData прокси).
+  - Социальные данные: `tweets:raw` (Tweetcord), `news:raw`, `xalpha:responses` (TelegramNews), `lunar:raw` (LunarXCord), `xalpha:raw` (XAlphaCord).
+  - Redis: `errors:detected`, `swarm:commands`.
+- **Выходы**:
+  - Redis: `tokens:new` (ticker, price, volume, marketCap, liquidity, fibonacciLevels).
+  - Redis: `news:signals` (marketCap, liquidity, snipers, devHoldings, age, volume1h, priceChange1h, holders, topHolders, socialVolume, socialScore, galaxyScore, sentiment, announcementImpact).
+- **Функции**:
+  - Скрапинг токенов с ротацией device_id/proxy.
+  - Резерв: 15 API (Raydium, Birdeye, Solscan, Cielo) из `api_sources.json` при ошибках (403, 429).
+  - Расчет Фибоначчи (23.6%, 38.2%, 50%, 61.8%) на основе 5-минутного импульса.
+  - Сбор социальных метрик через LunarCrush (saizk/LunarCrushAPI).
+  - Анализ настроений через ИИ-консилиум (DeepSeek, Gemini, YandexGPT, OpenAI, HuggingFace).
+- **Интеграции**:
+  - Telegram: MAIN_CHANNEL_ID (-1002206932592), MONITOR_CHANNEL_ID (-1002616465399).
+  - Tweetcord: `tweets:raw`.
+  - LunarXCord, XAlphaCord, TelegramNews: `lunar:raw`, `xalpha:raw`, `news:raw`, `xalpha:responses`.
+- **Зависимости**: puppeteer, axios, prom-client, p-limit, saizk/LunarCrushAPI, ioredis.
+- **Отказоустойчивость**:
+  - Circuit Breaker (opossum).
+  - Экспоненциальный backoff.
+  - Ротация API при ошибках.
+  - Логи: Winston (scrapers/logs/datahawk.log).
+- **Метрики Prometheus**: tokensFetched, apiLatency, sentimentRequestsTotal, freeApiRequestsTotal.
+
+### 2. TradeSensei
+- **Описание**: Генерация торговых сигналов через DQN и вебхуки TradingView, арбитраж сигналов.
+- **Входы**:
+  - Redis: `tokens:new`, `news:signals`, `tradingview:webhooks`, `models:updated`, `swarm:commands`.
+- **Выходы**:
+  - Redis: `signals:new` (ticker, action, confidence, entryType: 'fibonacci').
+  - Redis: `arbitration:decisions`.
+- **Функции**:
+  - Генерация сигналов через DQN (TensorFlow.js, дообучение каждые 5 мин).
+  - Обработка вебхуков TradingView (RSI, MACD, Bollinger).
+  - Входы на откатах по Фибоначчи (38.2%, 61.8%) с признаками роста (volume, whaleActivity).
+  - Трейлинг-стоп-лосс (-15% от локального максимума или следующий уровень Фибоначчи).
+  - Реинвест: 100% до $2,000, 75% до $5,000, 60% для 2–3 кошельков.
+  - Арбитраж через Gemini, DeepSeek, OpenAI.
+- **Интеграции**:
+  - DataHawk: `tokens:new`, `news:signals`.
+  - WebhookAgent: `tradingview:webhooks`.
+- **Зависимости**: tensorflow, axios, prom-client, ioredis.
+- **Отказоустойчивость**:
+  - Кэширование сигналов в Redis (TTL 300 сек).
+  - Circuit Breaker для API.
+  - Логи: Winston (scrapers/logs/tradesensei.log).
+- **Метрики Prometheus**: signalsGenerated, tradeSuccess, tradeFailure, arbitrationRequests.
+
+### 3. Orchestrator
+- **Описание**: Выполнение сделок (paper trading) через Jupiter API, применение фильтров.
+- **Входы**:
+  - Redis: `signals:new`, `swarm:commands`.
+- **Выходы**:
+  - Redis: `trades:executed` (ticker, action, positionSize, price, walletId, roi, entryType, exitReason).
+  - MongoDB: Сохранение сделок.
+- **Функции**:
+  - Paper trading ($1,000) через Jupiter API.
+  - Реинвест: 100% до $2,000, 75% до $5,000, 60% для 2–3 кошельков.
+  - Фильтры: Trending 5min, NextBC 5min, Solana Swing Sniper, NewlyReached10M.
+  - Входы по сигналам с entryType: 'fibonacci'.
+  - Трейлинг-стоп-лосс (-15% от локального максимума или следующий уровень Фибоначчи).
+- **Интеграции**:
+  - TradeSensei: `signals:new`.
+  - MongoDB: Хранение сделок.
+- **Зависимости**: axios, prom-client, ioredis, mongodb.
+- **Отказоустойчивость**:
+  - Повтор попыток при сбоях Jupiter API (exponential-backoff).
+  - Логи: Winston (scrapers/logs/orchestrator.log).
+- **Метрики Prometheus**: tradesExecutedTotal, partialExits, walletsCount.
+
+### 4. SystemMaster
+- **Описание**: Мониторинг ошибок, метрик, лимитов API и облачных ресурсов.
+- **Входы**:
+  - Redis: `trades:executed`, `swarm:commands`.
+  - Prometheus: Метрики (ROI, win rate, cloud_cpu_usage, cloud_ram_usage).
+- **Выходы**:
+  - Redis: `errors:detected`, `models:updated`.
+  - Telegram: Уведомления о метриках и лимитах (>80%).
+- **Функции**:
+  - Мониторинг ошибок и лимитов (CPU, RAM, запросы) через `cloud_providers.json`.
+  - Анализ облачных планов (Render Free, Render Starter, Vercel Free).
+  - Логирование ошибок в Redis (`error:{provider}:{task}`).
+  - Расчет экономии задач (`trade_sensei`: $0.0002/запрос, `data_hawk`: $0.0001/запрос).
+- **Интеграции**:
+  - SwarmMaster: `errors:detected`.
+  - Telegram: Уведомления через node-telegram-bot-api.
+- **Зависимости**: prom-client, ioredis, node-telegram-bot-api.
+- **Отказоустойчивость**:
+  - Логи: Winston (scrapers/logs/systemmaster.log).
+  - Уведомления при сбоях Redis/MongoDB.
+- **Метрики Prometheus**: freeApiRequestsTotal, aiApiCostTotal, cloudCpuUsage, cloudRamUsage.
+
+### 5. WebhookAgent
+- **Описание**: Обработка вебхуков TradingView, отправка Telegram-уведомлений.
+- **Входы**:
+  - Redis: `signals:new`, `swarm:commands`.
+  - TradingView: Вебхуки (RSI, MACD, Bollinger).
+- **Выходы**:
+  - Redis: `tradingview:webhooks`.
+  - Telegram: Уведомления с данными `news:signals`.
+- **Функции**:
+  - Валидация вебхуков через FilterGuard/HuggingFace.
+  - Отправка уведомлений с метриками (marketCap, liquidity, socialVolume, galaxyScore).
+- **Интеграции**:
+  - TradeSensei: `signals:new`.
+  - Telegram: node-telegram-bot-api.
+- **Зависимости**: node-telegram-bot-api, axios, prom-client, ioredis.
+- **Отказоустойчивость**:
+  - Повтор попыток при сбоях Telegram API.
+  - Логи: Winston (scrapers/logs/webhookagent.log).
+- **Метрики Prometheus**: telegramAlertsSent, webhookProcessed.
+
+### 6. SwarmMaster
+- **Описание**: Координация агентов, обработка ошибок, ежедневные отчёты.
+- **Входы**:
+  - Redis: `ai:responses`, `trades:executed`, `errors:detected`.
+- **Выходы**:
+  - Redis: `swarm:commands`, `errors:resolved`, `reports:daily`.
+  - Telegram: Уведомления о неразрешимых ошибках и отчётах.
+- **Функции**:
+  - Координация агентов (DataHawk, TradeSensei, FreeAIAgent) с приоритизацией сигналов (объём: 40%, тренд: 30%, новость: 30%).
+  - Обработка ошибок (429, 5xx) с переключением на `gpt4free` или повтором задач.
+  - Ежедневный отчёт (доход, сделки, проблемы, DQN, лучшая сделка) в 23:00.
+- **Интеграции**:
+  - SystemMaster: `errors:detected`.
+  - FreeAIAgent: `ai:responses`.
+  - Telegram: node-telegram-bot-api.
+- **Зависимости**: ioredis, prom-client, node-telegram-bot-api, node-schedule.
+- **Отказоустойчивость**:
+  - Логи: Winston (scrapers/logs/swarmmaster.log).
+  - Кэширование отчётов в Redis (TTL 24 часа).
+- **Метрики Prometheus**: coordinationRequestsTotal, tradesExecutedTotal.
+
+### 7. FreeAIAgent
+- **Описание**: Запросы к бесплатным AI API (`gpt4free`, `io.net`).
+- **Входы**:
+  - Задачи от SwarmMaster.
+- **Выходы**:
+  - Redis: `ai:responses`.
+- **Функции**:
+  - Выполнение AI-запросов с `IONET_API_KEY`.
+  - Ротация прокси через `free-proxy`.
+  - Кэширование в Redis (`gpt4free:cache:{task}:{prompt}`, TTL 1 час).
+- **Интеграции**:
+  - SwarmMaster: Получение задач.
+- **Зависимости**: axios-retry, free-proxy, opossum, ioredis, prom-client.
+- **Отказоустойчивость**:
+  - Circuit Breaker (opossum).
+  - Ротация прокси при сбоях.
+  - Логи: Winston (scrapers/logs/freeaiagent.log).
+- **Метрики Prometheus**: freeApiRequestsTotal, aiApiCostTotal.
+
+### 8. FilterGuard
+- **Описание**: Фильтрация токенов по рыночным и социальным метрикам.
+- **Входы**:
+  - Redis: `tokens:new`, `news:signals`, `tweets:raw`, `news:raw`, `lunar:raw`, `xalpha:raw`.
+- **Выходы**:
+  - Redis: `tokens:filtered`.
+  - MongoDB: `filter_results`.
+  - Telegram: Уведомления о прошедших токенах.
+- **Функции**:
+  - Фильтры: Trending 5min, NextBC 5min, Solana Swing Sniper, NewlyReached10M.
+  - Входы на Фибоначчи (38.2%, 61.8%) с `checkSwingSniperPatterns`.
+  - Учёт рыночных сессий (Азия, Европа, США) через `getActiveMarkets`.
+  - Пропуск токенов с высокой социальной активностью (`hasInfluencers`, `sentiment > 0.9`).
+  - Пакетная загрузка данных из MongoDB (`$in`).
+  - Кэширование API-ответов (TTL 300 сек).
+- **Интеграции**:
+  - DataHawk: `tokens:new`, `news:signals`.
+  - Tweetcord, TelegramNews, LunarXCord, XAlphaCord: Социальные данные.
+- **Зависимости**: axios, ioredis, p-limit, opossum, mongodb, prom-client, node-telegram-bot-api.
+- **Отказоустойчивость**:
+  - Circuit Breaker (opossum).
+  - Параллельная обработка (`p-limit=20`).
+  - Логи: Winston (scrapers/logs/filterguard.log).
+- **Метрики Prometheus**: filterPassed, filterFailed, filterDurationSeconds.
+
+### 9. Tweetcord
+- **Описание**: Мониторинг твитов инфлюенсеров и китов.
+- **Входы**:
+  - Twitter: @WatcherGuru, @elonmusk, @whalewatchalert, @antiscammer2022 (tweepy).
+- **Выходы**:
+  - Redis: `tweets:raw` (ticker, category: influencer/whale/news, sentiment).
+- **Функции**:
+  - Парсинг тикеров из твитов.
+  - Категоризация твитов.
+  - Публикация в `tweets:raw` для анализа в DataHawk.
+- **Интеграции**:
+  - DataHawk: `tweets:raw`.
+- **Зависимости**: tweepy>=4.14.0, redis-py>=5.0.0, python-dotenv>=1.0.0.
+- **Отказоустойчивость**:
+  - Повтор попыток при сбоях Twitter API.
+  - Логи: logging.handlers (scrapers/logs/tweetcord.log).
+- **Метрики Prometheus**: tickerExtraction, tweetProcessed.
+
+### 10. TelegramNews
+- **Описание**: Мониторинг Telegram-каналов и ответов XAlpha.
+- **Входы**:
+  - Telegram: @CabalTracker, @gmgnsignals, @solearlytrending (Telethon).
+  - XAlpha: Группа -1004838531435, канал -1002653946841.
+- **Выходы**:
+  - Redis: `news:raw` (тикеры, контракты).
+  - Redis: `xalpha:responses` (socialPosts, influenceScore, sentiment).
+- **Функции**:
+  - Парсинг тикеров и контрактов из каналов.
+  - Извлечение социальных метрик из ответов XAlpha на команду /x.
+  - Категоризация каналов (call, wallet, trend, cto, fdv, news).
+  - Fallback на парсинг комментариев канала -1002653946841 при ошибке "Could not find the input entity".
+- **Интеграции**:
+  - XAlphaBot: Контракты для команды /x.
+  - LunarXCord: `xalpha:responses`.
+  - DataHawk: `news:raw`, `xalpha:responses`.
+- **Зависимости**: telethon>=1.36.0, redis-py>=5.0.0, python-dotenv>=1.0.0.
+- **Отказоустойчивость**:
+  - Try-catch для ошибок Telethon.
+  - Логи: logging.handlers (scrapers/logs/telegramnews.log).
+- **Метрики Prometheus**: telegramSignalsProcessed, telegramApiErrors, telegramCheckLatency.
+
+### 11. XAlphaBot
+- **Описание**: Отправка команд /x в Telegram-канал для получения социальных метрик.
+- **Входы**:
+  - Redis: `news:raw` (контракты токенов).
+- **Выходы**:
+  - Telegram: Команды /x в канал -1002653946841.
+- **Функции**:
+  - Отправка команд /x с контрактами (задержка 5 сек).
+  - Требуются права администратора в группе -1004838531435.
+- **Интеграции**:
+  - TelegramNews: `news:raw`, `xalpha:responses`.
+  - LunarXCord: `xalpha:responses`.
+- **Зависимости**: node-telegram-bot-api>=0.61.0, ioredis>=5.3.2, prom-client>=14.2.0, winston>=3.13.0.
+- **Отказоустойчивость**:
+  - Повтор попыток при сбоях Telegram API.
+  - Логи: winston-daily-rotate-file (scrapers/logs/xalphabot.log).
+- **Метрики Prometheus**: xalphaCommandsSentTotal, xalphaCommandErrorsTotal.
+
+### 12. LunarXCord
+- **Описание**: Сбор социальных и рыночных метрик токенов.
+- **Входы**:
+  - Redis: `news:raw` (контракты), `xalpha:responses` (социальные метрики).
+  - Dexscreener API: Рыночные данные (цена, объём, marketCap).
+- **Выходы**:
+  - Redis: `lunar:raw` (ticker, socialVolume, socialScore, galaxyScore, socialPosts, sentiment, contract).
+- **Функции**:
+  - Извлечение до 30 контрактов из `news:raw`.
+  - Обогащение данными из `xalpha:responses` (socialPosts, influenceScore, sentiment).
+  - Расчет: socialVolume (объём * (socialPosts + 1) / 1000), socialScore (influenceScore * 10), galaxyScore (socialScore * 0.8).
+  - Fallback: GMGN.ai через aiohttp при пустом `news:raw`.
+- **Интеграции**:
+  - TelegramNews, XAlphaBot: `news:raw`, `xalpha:responses`.
+  - DataHawk: `lunar:raw`.
+- **Зависимости**: aiohttp>=3.8.0, redis-py>=5.0.0, python-dotenv>=1.0.0, circuitbreaker>=2.0.0.
+- **Отказоустойчивость**:
+  - Circuit Breaker для Dexscreener API (5 неудач, восстановление 60 сек).
+  - Логи: logging.handlers (scrapers/logs/lunarxcord.log).
+- **Метрики Prometheus**: lunarRawProcessed.
+
+### 13. XAlphaCord
+- **Описание**: Скрапинг социальных метрик с x-alpha.ai.
+- **Входы**:
+  - x-alpha.ai (/app/trending) через Playwright.
+  - Telegram: Авторизация (TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE).
+- **Выходы**:
+  - Redis: `xalpha:raw` (ticker, socialPosts, sentiment, influenceScore).
+- **Функции**:
+  - Скрапинг топ-10 токенов каждые 5 мин.
+  - Ротация user-agent (fake-useragent) и прокси (BrightData).
+- **Интеграции**:
+  - DataHawk: `xalpha:raw`.
+- **Зависимости**: playwright>=1.40.0, redis-py>=5.0.0, telethon>=1.36.0, fake-useragent>=1.5.0.
+- **Отказоустойчивость**:
+  - Повтор попыток при сбоях Playwright.
+  - Логи: winston (scrapers/logs/xalphacord.log).
+- **Метрики Prometheus**: xalphaRawProcessed.
+
+### 14. WebInterface
+- **Описание**: React-дашборд для мониторинга токенов, сделок, ошибок, отчётов.
+- **Входы**:
+  - WebSocket: `errors:detected`, `errors:resolved`, `reports:daily` (socket.io).
+  - Prometheus: Метрики (ROI, win rate, cloud_cpu_usage).
+- **Выходы**:
+  - UI: Таблицы токенов, сигналов, статистика, ошибки, отчёты.
+- **Функции**:
+  - Real-time отображение метрик и ошибок.
+  - Компоненты: ErrorDashboard, DailyReport.
+  - Фильтры: Чекбоксы для Trending 5min, NextBC 5min, Solana Swing Sniper, NewlyReached10M.
+- **Интеграции**:
+  - SystemMaster, SwarmMaster: `errors:detected`, `reports:daily`.
+- **Зависимости**: react, socket.io-client, tailwindcss.
+- **Отказоустойчивость**:
+  - Повтор подключения WebSocket.
+  - Логи: Console (frontend/logs/webinterface.log).
+- **Метрики Prometheus**: None.
+
+## Общая отказоустойчивость
+- **Circuit Breaker**: opossum (Node.js), circuitbreaker (Python).
+- **Экспоненциальный backoff**: Для API-запросов.
+- **Ротация логов**: winston-daily-rotate-file (Node.js), logging.handlers (Python).
+- **Кэширование**: Redis (TTL 300 сек для API, 1 час для AI).
+- **CI/CD**: GitHub Actions, health-check (/health).
+- **Мониторинг**: Prometheus (queue_length, apiLatency, tradeSuccess, filterPassed, etc.).
+
+## Переменные окружения
+- TELEGRAM_BOT_TOKEN, XALPHA_BOT_TOKEN, XALPHA_CHANNEL_ID, XALPHA_GROUP_ID.
+- BIRDEYE_API_KEY, SOLSCAN_API_KEY, DRPC_API_KEY, HELIUS_API_KEY.
+- DEEPSEEK_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, HUGGINGFACE_API_KEY.
+- REDIS_URL, MONGO_URI, PROMETHEUS_URL.
+- TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE.
+- IONET_API_KEY, BRIGHTDATA_PROXY.
+
+## Технические детали
+- **Node.js**: 18-alpine.
+- **Python**: 3.9-slim.
+- **Redis**: 7.0.
+- **MongoDB**: 5.0.
+- **Docker**: Контейнеры для Node.js, Tweetcord, TelegramNews, LunarXCord, XAlphaCord, XAlphaBot.
+- **WebSocket**: socket.io для real-time дашборда.
+- **Prometheus**: Метрики (tokensFetched, signalsGenerated, apiLatency, etc.).
